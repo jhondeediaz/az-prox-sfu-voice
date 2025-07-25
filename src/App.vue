@@ -7,7 +7,8 @@
 
     <div v-else class="main-ui">
   <label><input type="checkbox" v-model="proximityEnabled" @change="toggleProximity" /> Enable Proximity</label>
-  <label><input type="checkbox" v-model="muted" @change="toggleMute" /> Mute</label>
+  <label><input type="checkbox" v-model="muted" @change="toggleMuteHandler" /> Mute</label>
+  <label><input type="checkbox" v-model="deafened" @change="toggleDeafenHandler" /> Deafen</label>
 
   <button @click="guidSet = false">Change GUID</button>
 
@@ -30,13 +31,18 @@ import {
   setGuid,
   getNearbyPlayers,
   reconnectSocket,
+  connectProximitySocket, 
+  disconnectProximity,
+  toggleMute,
+  toggleDeafen
 } from "./webrtcClient.js";
 
 const guidInput = ref("");
 const guidSet = ref(false);
-const proximityEnabled = ref(true);
 const muted = ref(false);
+const deafened = ref(false);
 const nearbyPlayers = ref([]);
+const proximityEnabled = ref(true)
 
 function setGuidHandler() {
   if (guidInput.value) {
@@ -46,15 +52,25 @@ function setGuidHandler() {
   }
 }
 
+
 function toggleProximity() {
   if (proximityEnabled.value) {
-    reconnectSocket();
+    // user just *checked* the box
+    connectProximitySocket()
+  } else {
+    // user just *unchecked* the box
+    disconnectProximity()
   }
 }
 
-function toggleMute() {
-  const audios = document.querySelectorAll("audio");
-  audios.forEach((a) => (a.muted = muted.value));
+function toggleMuteHandler() {
+  toggleMute(muted.value)
+}
+
+function toggleDeafenHandler() {
+toggleDeafen(deafened.value)
+toggleMute(deafened.value)
+muted.value = deafened.value
 }
 
 onMounted(() => {

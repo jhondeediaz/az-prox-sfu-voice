@@ -108,45 +108,59 @@ function _updateNearby() {
 
 // ————— Join SFU & publish mic —————
 async function _joinAndPublish(roomId) {
-  log('Switching to room:', roomId)
+  log('Switching to room:', roomId);
 
+  // close old client if any
   if (client) {
-    try { await client.close() }
-    catch (e) { log('Error closing old client', e) }
-    client = null
+    try { await client.close(); } catch(e){ log('close error', e) }
+    client = null;
   }
 
-  signal = new IonSFUJSONRPCSignal(SFU_WS)
-  client = new SFUClient(signal)
+  signal = new IonSFUJSONRPCSignal(SFU_WS);
+  client = new SFUClient(signal);
 
   signal.onopen = async () => {
-    log('Signal open, joining SFU room:', roomId)
+    log('Signal open, joining SFU room:', roomId);
 
-    // 1) get a LocalStream so publish() is available
-    localStream = await LocalStream.getUserMedia({ audio: true, video: false })
-
-    // 2) join with your GUID
-    await client.join(roomId, guid)
-
-    // 3) then publish your mic
-    await client.publish(localStream)
-    log('Published local stream')
-
-    // 4) handle incoming audio + (initial) full volume
+    // 1) Prepare your remote‐track handler *before* join()
     client.ontrack = (track, stream) => {
-      if (track.kind !== 'audio') return
-      log('Received remote audio track:', stream.id)
+      if (track.kind !== 'audio') return;
+      log('Received remote audio track:', stream.id, 'from peerId=', stream.peerId);
 
-      const audio = new Audio()
-      audio.srcObject = stream
-      audio.autoplay = true
-      document.body.appendChild(audio)
-      audioEls[stream.id] = audio
+      const audio = new Audio();
+      audio.srcObject = stream;
+      audio.autoplay = true;
+      document.body.appendChild(audio);
+      audioEls[stream.id] = audio;
 
-      // temporary full volume so you can confirm you hear them
-      audio.volume = 1.0
-    }
+      // start at full volume; you can add attenuation later
+      audio.volume = 1.0;
+    };
+
+    // 2) Grab your mic (LocalStream so publish() works)
+    localStream = await LocalStream.getUserMedia({ audio: true, video: false });
+
+    // 3) Join the room with your GUID
+    await client.join(roomId, guid);
+
+    // 4) Immediately publish your mic
+    await client.publish(localStream);
+    log('Published local stream');
+  };
+}
+
+// Tell the code not to auto-reconnect, then close the socket.
+export function disconnectProximity() {
+  manuallyClosed = true;
+  if (proximitySocket) proximitySocket.close();
+  proximitySocket = null;
+  // if you also want to leave the SFU room immediately:
+  currentRoom = null;
+  if (client) {
+    client.close().catch(() => {});
+    client = null;
   }
+  log('Proximity completely disabled by user');
 }
 
 // ————— Auto-bootstrap on load —————
@@ -155,3 +169,51 @@ if (saved) {
   setGuid(saved)
   connectProximitySocket()
 }
+
+export function toggleMute(shouldMute) {
+  if (!localStream) {
+    return log('Cannot mute: localStream not initialized');
+  }
+
+  // figure out the actual MediaStream object
+  let ms;
+  if (localStream.mediaStream) {
+    // Ion LocalStream exposes .mediaStream
+    ms = localStream.mediaStream;
+  } else if (localStream.stream) {
+    // some versions expose .stream
+    ms = localStream.stream;
+  } else if (localStream instanceof MediaStream) {
+    // or it might itself be a MediaStream
+    ms = localStream;
+  }
+
+  if (!ms) {
+    return log('Cannot mute: no underlying MediaStream found on localStream');
+  }
+
+  // disable/enable every audio track
+  ms.getAudioTracks().forEach(track => {
+    track.enabled = !shouldMute;
+  });
+
+  log(`Microphone ${shouldMute ? 'muted' : 'unmuted'}`);
+}
+
+export function toggleDeafen(shouldDeafen) {
+  // 1) Mute/unmute remote audio elements
+  Object.values(audioEls).forEach(audio => {
+    audio.muted = shouldDeafen;
+  });
+
+  // 2) Mute/unmute your mic tracks
+  if (localStream && localStream.stream) {
+    localStream.stream.getAudioTracks().forEach(track => {
+      track.enabled = !shouldDeafen;
+    });
+  }
+
+  log('Toggled deafen:', shouldDeafen);
+}
+
+
