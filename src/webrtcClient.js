@@ -1,5 +1,3 @@
-// webrtcClient.js
-
 import { IonSFUJSONRPCSignal } from 'ion-sdk-js/lib/signal/json-rpc-impl'
 import SFUClient               from 'ion-sdk-js/lib/client'
 import { LocalStream }         from 'ion-sdk-js'
@@ -209,60 +207,53 @@ async function _joinAndPublish(roomId) {
     log('Signal open, joining SFU room:', roomId)
 
     // prepare remote track handler
-	  client.ontrack = (track, remoteStream) => {
+	  // at top‐level of your module
+const audioCtx = new AudioContext();
+
+	  // helper – linear fade from 0→100yd
+function computeVolume(dist) {
+  if (dist <= 0)   return 1.0;
+  if (dist >= 100) return 0.0;
+  return 1 - (dist / 100);
+}
+
+client.ontrack = (track, remoteStream) => {
   if (track.kind !== 'audio') return;
 
-  // 1) pull out the actual MediaStream
-  const ms = remoteStream.mediaStream;
-  if (!ms) {
-    log('ontrack: no mediaStream on remoteStream');
-    return;
-  }
+  const peerId = remoteStream.peerId;  // this is your GUID string
 
-  // 2) hook it into the Web Audio API
-  const audioCtx  = new AudioContext();
-  const source    = audioCtx.createMediaStreamSource(ms);
-  const gainNode  = audioCtx.createGain();
-  source.connect(gainNode).connect(audioCtx.destination);
+  console.log('[webrtc] ontrack for peer', peerId);
 
-  // 3) store the gainNode so we can update volume over time
-  audioEls[remoteStream.id] = { gainNode, mediaStream: ms };
+  // Create a hidden <audio> element
+  const audio = new Audio();
+  audio.srcObject = remoteStream.mediaStream || remoteStream;
+  audio.autoplay = true;
+  audio.controls = false;
+  audio.style.display = 'none';
+  document.body.appendChild(audio);
 
-  // 4) record the streamId on your state.players entry
-  const peerEntry = state.players.find(p => p.guid.toString() === remoteStream.peerId);
-  if (peerEntry) {
-    peerEntry.streamId = remoteStream.id;
-  }
+  // Store it by peerId for quick lookup
+  audioEls[peerId] = audio;
 
-  log('Playing incoming audio from', remoteStream.peerId, 'streamId=', remoteStream.id);
-
-  // 5) start your attenuation loop
+  // Start a small loop to attenuate by distance
   setInterval(() => {
-    if (!state.self) {
-      gainNode.gain.value = 0;
+    const me   = state.self;
+    const peer = state.players.find(p => p.guid.toString() === peerId);
+
+    if (!me || !peer) {
+      audio.volume = 0;
       return;
     }
 
-    const peer = state.players.find(p => p.streamId === remoteStream.id);
-    if (!peer) {
-      gainNode.gain.value = 0;
-      return;
-    }
-
-    const dx   = peer.x - state.self.x;
-    const dy   = peer.y - state.self.y;
-    const dz   = (peer.z||0) - (state.self.z||0);
+    const dx   = peer.x - me.x;
+    const dy   = peer.y - me.y;
+    const dz   = (peer.z || 0) - (me.z || 0);
     const dist = Math.hypot(dx, dy, dz);
 
-    // your 100-yard curve:
-    const vol = dist <= 20  ? 1.0
-              : dist <= 40  ? 0.8
-              : dist <= 60  ? 0.6
-              : dist <= 80  ? 0.4
-              : dist <= 100 ? 0.2
-              : 0.0;
-
-    gainNode.gain.value = vol;
+    const vol = computeVolume(dist);
+    audio.volume = vol;
+    // debugging log:
+    console.log(`[webrtc] set vol=${vol.toFixed(2)} for ${peerId} @ ${dist.toFixed(1)}yd`);
   }, 250);
 };
 
