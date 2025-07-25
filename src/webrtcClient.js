@@ -1,3 +1,5 @@
+// webrtcClient.js
+
 import { IonSFUJSONRPCSignal } from 'ion-sdk-js/lib/signal/json-rpc-impl'
 import SFUClient               from 'ion-sdk-js/lib/client'
 import { LocalStream }         from 'ion-sdk-js'
@@ -12,50 +14,79 @@ let manuallyClosed  = false
 let signal          = null
 let client          = null
 let localStream     = null
-let currentRoom     = null
-const audioEls      = {}
+
+// track which room & map we're currently in
+let currentRoom     = null    // e.g. "map-1"
+let lastSelfMapId   = null    // e.g. 1, 509, etc.
+
+const audioEls      = {}      // stream.id → HTMLAudioElement
 const state         = { self: null, players: [], nearby: [] }
+
+// callback hook for UI
+let onNearbyUpdate  = null
 
 function log(...args) {
   if (DEBUG) console.log('[webrtc]', ...args)
 }
 
-// ————— API for App.vue —————
+// ─── Public API for App.vue ────────────────────────────────────────────────
+
+/** Set your GUID (string or number) */
 export function setGuid(id) {
   guid = id.toString()
   localStorage.setItem('guid', guid)
   log('GUID set to', guid)
 }
 
+/** Register a callback: cb(nearbyArray) */
+export function onNearby(cb) {
+  onNearbyUpdate = cb
+}
+
+/** Imperative pull of the latest nearby list */
 export function getNearbyPlayers() {
   return state.nearby
 }
 
-export function reconnectSocket() {
-  manuallyClosed = true
-  if (proximitySocket) proximitySocket.close()
-  manuallyClosed = false
-  connectProximitySocket()
+/** Mute or unmute your *microphone* */
+export function toggleMute(shouldMute) {
+  if (!localStream) return log('Cannot mute: no localStream')
+  // find the real MediaStream
+  let ms = localStream.mediaStream || localStream.stream || 
+           (localStream instanceof MediaStream ? localStream : null)
+  if (!ms) return log('Cannot mute: no MediaStream found')
+  ms.getAudioTracks().forEach(track => track.enabled = !shouldMute)
+  log(`Microphone ${shouldMute ? 'muted' : 'unmuted'}`)
 }
 
-// ————— Proximity socket + reconnection —————
+/** Deafen or undeafen: mic + speakers */
+export function toggleDeafen(shouldDeafen) {
+  // 1) Mute/unmute incoming
+  Object.values(audioEls).forEach(audio => audio.muted = shouldDeafen)
+  // 2) Mute/unmute mic
+  if (localStream) {
+    let ms = localStream.mediaStream || localStream.stream ||
+             (localStream instanceof MediaStream ? localStream : null)
+    if (ms) ms.getAudioTracks().forEach(track => track.enabled = !shouldDeafen)
+  }
+  log(`Deafen ${shouldDeafen ? 'on' : 'off'}`)
+}
+
+// ─── Proximity Socket Management ───────────────────────────────────────────
+
+/** (Re)open the proximity WebSocket */
 export function connectProximitySocket() {
   if (!guid) {
-    log('GUID not set; cannot open proximity socket.')
-    return
+    return log('Cannot open proximity socket: GUID not set')
   }
-
-  if (
-    proximitySocket &&
-    (proximitySocket.readyState === WebSocket.OPEN ||
-     proximitySocket.readyState === WebSocket.CONNECTING)
+  if (proximitySocket &&
+      (proximitySocket.readyState === WebSocket.OPEN ||
+       proximitySocket.readyState === WebSocket.CONNECTING)
   ) {
-    log('Proximity socket already open or connecting.')
-    return
+    return log('Proximity socket already open/connecting')
   }
 
   proximitySocket = new WebSocket(PROXIMITY_WS)
-
   proximitySocket.onopen  = () => log('Connected to proximity server')
   proximitySocket.onerror = e  => log('Proximity socket error', e)
   proximitySocket.onclose = () => {
@@ -66,170 +97,171 @@ export function connectProximitySocket() {
     }
   }
 
-	proximitySocket.onmessage = ({ data }) => {
-  // 1) Parse the full object: { mapId: [players], … }
-  const maps = JSON.parse(data);
+  proximitySocket.onmessage = ({ data }) => {
+    const maps = JSON.parse(data)
+    log('got maps payload →', maps)
 
-  // 2) Locate your own packet across *all* maps
-  let selfPacket = null;
-  for (const [mapId, players] of Object.entries(maps)) {
-    const match = players.find(p => p.guid.toString() === guid);
-    if (match) {
-      selfPacket = match;
-      break;
+    // 1) find self
+    let selfPacket = null
+    for (const players of Object.values(maps)) {
+      const f = players.find(p => p.guid.toString() === guid)
+      if (f) { selfPacket = f; break }
     }
+    if (!selfPacket) {
+      return log('onmessage → no entry for my GUID yet')
+    }
+
+    // 2) update state.self + state.players
+    state.self = selfPacket
+    const mk = selfPacket.map.toString()
+    const arr = maps[mk] || []
+    state.players = arr.filter(p => p.guid.toString() !== guid)
+    log(`players on map ${mk} →`, state.players)
+
+    // 3) recompute nearby + maybe join room
+    _updateNearby()
   }
-  if (!selfPacket) {
-    // you aren’t in that roster (yet), so nothing to do
-    return;
-  }
-
-  // 3) Update your self state and remember your current map
-  state.self = selfPacket;
-  const currentMapId = selfPacket.map.toString();
-
-  // 4) Pull out *only* the players on your map, excluding you
-  const mapPlayers = maps[currentMapId] || [];
-  state.players = mapPlayers.filter(p => p.guid.toString() !== guid);
-
-  // 5) Re-run your proximity logic
-  _updateNearby();
-};
-
 }
 
-// ————— Proximity → SFU logic —————
-function _updateNearby() {
-  const me = state.self
-  if (!me) return
+/** Force a manual reconnect */
+export function reconnectSocket() {
+  manuallyClosed = true
+  if (proximitySocket) proximitySocket.close()
+  manuallyClosed = false
+  connectProximitySocket()
+}
 
+/** Cleanly disable proximity + leave SFU room */
+export function disconnectProximity() {
+  manuallyClosed = true
+  if (proximitySocket) proximitySocket.close()
+  proximitySocket = null
+  currentRoom      = null
+  if (client) {
+    client.close().catch(()=>{})
+    client = null
+  }
+  log('Proximity disabled')
+}
+
+// ─── Proximity → SFU Logic ────────────────────────────────────────────────
+
+/** Recompute `state.nearby` and notify UI */
+function _updateNearby() {
+  if (!state.self) return
+
+  // compute distances
   const nearby = state.players
-    .filter(p => p.map === me.map && p.guid !== guid)
-    .map(p => {
-      const dx = p.x - me.x
-      const dy = p.y - me.y
-      const dz = (p.z||0) - (me.z||0)
-      return { ...p, distance: Math.hypot(dx, dy, dz) }
-    })
+    .map(p => ({
+      ...p,
+      distance: Math.hypot(
+        p.x - state.self.x,
+        p.y - state.self.y,
+        (p.z||0) - (state.self.z||0)
+      )
+    }))
     .filter(p => p.distance <= 60)
 
   state.nearby = nearby
+  log('state.nearby →', nearby)
+  if (onNearbyUpdate) onNearbyUpdate(nearby)
 
-  const room = `map-${me.map}`
-  if (nearby.length && room !== currentRoom) {
-    _joinAndPublish(room)
+  // handle SFU room join
+  _maybeJoinRoom()
+}
+
+/** Decide when to join/publish to the SFU room */
+async function _maybeJoinRoom() {
+  const me = state.self
+  if (!me) return
+
+  const room  = `map-${me.map}`
+
+  // 1) if map changed, join immediately
+  if (me.map !== lastSelfMapId) {
+    lastSelfMapId = me.map
+    log('Map changed → joining room', room)
+    await _joinAndPublish(room)
+    currentRoom = room
+    return
+  }
+
+  // 2) if someone is nearby and not in room yet
+  if (state.nearby.length > 0 && room !== currentRoom) {
+    log('Someone nearby → joining room', room)
+    await _joinAndPublish(room)
     currentRoom = room
   }
 }
 
-// ————— Join SFU & publish mic —————
+/** Join SFU via Ion + publish your mic */
 async function _joinAndPublish(roomId) {
-  log('Switching to room:', roomId);
-
-  // close old client if any
+  // cleanup old client
   if (client) {
-    try { await client.close(); } catch(e){ log('close error', e) }
-    client = null;
+    try { await client.close() } catch(e){ log('close error',e) }
+    client = null
   }
 
-  signal = new IonSFUJSONRPCSignal(SFU_WS);
-  client = new SFUClient(signal);
+  signal = new IonSFUJSONRPCSignal(SFU_WS)
+  client = new SFUClient(signal)
 
   signal.onopen = async () => {
-    log('Signal open, joining SFU room:', roomId);
+    log('Signal open, joining SFU room:', roomId)
 
-    // 1) Prepare your remote‐track handler *before* join()
-    client.ontrack = (track, stream) => {
-      if (track.kind !== 'audio') return;
-      log('Received remote audio track:', stream.id, 'from peerId=', stream.peerId);
+    // prepare remote track handler
+	  client.ontrack = (track, stream) => {
+  if (track.kind !== 'audio') return;
 
-      const audio = new Audio();
-      audio.srcObject = stream;
-      audio.autoplay = true;
-      document.body.appendChild(audio);
-      audioEls[stream.id] = audio;
+  // 1) create an AudioContext graph for this stream
+  const audioCtx = new AudioContext();
+  const src      = audioCtx.createMediaStreamSource(stream);
+  const gainNode = audioCtx.createGain();
+  src.connect(gainNode).connect(audioCtx.destination);
 
-      // start at full volume; you can add attenuation later
-      audio.volume = 1.0;
-    };
+  // 2) store the gainNode so you can adjust it later
+  audioEls[stream.id] = { stream, gainNode };
 
-    // 2) Grab your mic (LocalStream so publish() works)
-    localStream = await LocalStream.getUserMedia({ audio: true, video: false });
+  // 3) kick off periodic attenuation based on distance
+  setInterval(() => {
+    if (!state.self) {
+      gainNode.gain.value = 0;
+      return;
+    }
 
-    // 3) Join the room with your GUID
-    await client.join(roomId, guid);
+    // find the peer in your players list by stream.id
+    const peer = state.players.find(p => p.streamId === stream.id);
+    if (!peer) {
+      gainNode.gain.value = 0;
+      return;
+    }
 
-    // 4) Immediately publish your mic
-    await client.publish(localStream);
-    log('Published local stream');
-  };
-}
+    // compute 3D distance
+    const dx = peer.x - state.self.x;
+    const dy = peer.y - state.self.y;
+    const dz = (peer.z||0) - (state.self.z||0);
+    const dist = Math.hypot(dx, dy, dz);
 
-// Tell the code not to auto-reconnect, then close the socket.
-export function disconnectProximity() {
-  manuallyClosed = true;
-  if (proximitySocket) proximitySocket.close();
-  proximitySocket = null;
-  // if you also want to leave the SFU room immediately:
-  currentRoom = null;
-  if (client) {
-    client.close().catch(() => {});
-    client = null;
+    // set gain based on your 100-yard curve
+    gainNode.gain.value = dist <= 20  ? 1.0
+                            : dist <= 40  ? 0.8
+                            : dist <= 60  ? 0.6
+                            : dist <= 80  ? 0.4
+                            : dist <= 100 ? 0.2
+                            : 0;
+  }, 250);
+};
+
+    // get mic & join+publish
+    localStream = await LocalStream.getUserMedia({ audio: true, video: false })
+    await client.join(roomId, guid)
+    await client.publish(localStream)
+    log('Published local stream')
   }
-  log('Proximity completely disabled by user');
 }
 
-// ————— Auto-bootstrap on load —————
+// ─── Auto‐bootstrap on load if GUID saved ──────────────────────────────────
 const saved = localStorage.getItem('guid')
 if (saved) {
   setGuid(saved)
   connectProximitySocket()
 }
-
-export function toggleMute(shouldMute) {
-  if (!localStream) {
-    return log('Cannot mute: localStream not initialized');
-  }
-
-  // figure out the actual MediaStream object
-  let ms;
-  if (localStream.mediaStream) {
-    // Ion LocalStream exposes .mediaStream
-    ms = localStream.mediaStream;
-  } else if (localStream.stream) {
-    // some versions expose .stream
-    ms = localStream.stream;
-  } else if (localStream instanceof MediaStream) {
-    // or it might itself be a MediaStream
-    ms = localStream;
-  }
-
-  if (!ms) {
-    return log('Cannot mute: no underlying MediaStream found on localStream');
-  }
-
-  // disable/enable every audio track
-  ms.getAudioTracks().forEach(track => {
-    track.enabled = !shouldMute;
-  });
-
-  log(`Microphone ${shouldMute ? 'muted' : 'unmuted'}`);
-}
-
-export function toggleDeafen(shouldDeafen) {
-  // 1) Mute/unmute remote audio elements
-  Object.values(audioEls).forEach(audio => {
-    audio.muted = shouldDeafen;
-  });
-
-  // 2) Mute/unmute your mic tracks
-  if (localStream && localStream.stream) {
-    localStream.stream.getAudioTracks().forEach(track => {
-      track.enabled = !shouldDeafen;
-    });
-  }
-
-  log('Toggled deafen:', shouldDeafen);
-}
-
-
