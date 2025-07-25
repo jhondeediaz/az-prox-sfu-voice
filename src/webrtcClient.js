@@ -129,21 +129,17 @@ function updateAllVolumes() {
   for (const peer of state.players) {
     const peerId = peer.guid.toString();
     const audio  = audioEls[peerId];
-    if (!audio) continue;  
+    if (!audio) continue;  // no audio yet
 
-    // compute 3D distance
     const dx   = peer.x - state.self.x;
     const dy   = peer.y - state.self.y;
     const dz   = (peer.z||0) - (state.self.z||0);
     const dist = Math.hypot(dx, dy, dz);
 
-    // linear fade 0→100 yd
-    let vol = 1 - (dist / 100);
-    if (vol < 0) vol = 0;
-    audio.volume = vol;
-
+    audio.volume = computeVolume(dist);
     console.log(
-      `[webrtc] volume[${peerId}] = ${vol.toFixed(2)} for ${dist.toFixed(1)}yd`
+      `[webrtc] volume[${peerId}] = ${audio.volume.toFixed(2)} ` +
+      `for dist ${dist.toFixed(1)} yd`
     );
   }
 }
@@ -238,29 +234,27 @@ async function _joinAndPublish(roomId) {
 const audioCtx = new AudioContext();
 
 	  // helper – linear fade from 0→100yd
+	  // webrtcClient.js (near top)
 function computeVolume(dist) {
+  // linear fade: 0 → 100 yd maps 1.0 → 0.0
   if (dist <= 0)   return 1.0;
   if (dist >= 100) return 0.0;
-  return 1 - (dist / 100);
+  return 1 - dist / 100;
 }
 
 client.ontrack = (track, remoteStream) => {
   if (track.kind !== 'audio') return;
 
   const peerId = remoteStream.peerId.toString();
-  console.log('[webrtc] attaching audio for peer', peerId);
+  console.log('[webrtc] ontrack for', peerId);
 
-  // create & play, no controls, visible or not—doesn’t matter
   const audio = new Audio();
-  audio.srcObject = remoteStream.mediaStream || remoteStream;
+  audio.srcObject = remoteStream.mediaStream;
   audio.autoplay = true;
+  audio.style.display = 'none';
   document.body.appendChild(audio);
-  
-  // store by peerId so we can update its volume later
-  audioEls[peerId] = audio;
 
-  // start at full volume
-  audio.volume = 1.0;
+  audioEls[peerId] = audio;
 };
 
     // get mic & join+publish
