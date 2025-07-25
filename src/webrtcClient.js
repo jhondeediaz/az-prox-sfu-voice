@@ -1,9 +1,9 @@
 import { IonSFUJSONRPCSignal } from 'ion-sdk-js/lib/signal/json-rpc-impl'
-import { Client, LocalStream }       from 'ion-sdk-js'
+import SFUClient               from 'ion-sdk-js/lib/client'
+import { LocalStream }         from 'ion-sdk-js'
 
 const PROXIMITY_WS = import.meta.env.VITE_PROXIMITY_WS
 const SFU_WS       = import.meta.env.VITE_SFU_WS
-
 export const DEBUG = true
 
 let guid            = null
@@ -45,7 +45,6 @@ export function connectProximitySocket() {
     return
   }
 
-  // already open/connecting?
   if (
     proximitySocket &&
     (proximitySocket.readyState === WebSocket.OPEN ||
@@ -119,12 +118,12 @@ async function _joinAndPublish(roomId) {
   }
 
   signal = new IonSFUJSONRPCSignal(SFU_WS)
-  client = new Client(signal)
+  client = new SFUClient(signal)
 
   signal.onopen = async () => {
     log('Signal open, joining SFU room:', roomId)
 
-    // 1) get a LocalStream (wraps MediaStream so client.publish works)
+    // 1) get a LocalStream so publish() is available
     localStream = await LocalStream.getUserMedia({ audio: true, video: false })
 
     // 2) join with your GUID
@@ -134,7 +133,7 @@ async function _joinAndPublish(roomId) {
     await client.publish(localStream)
     log('Published local stream')
 
-    // 4) handle incoming audio and volume fall-off
+    // 4) handle incoming audio + (initial) full volume
     client.ontrack = (track, stream) => {
       if (track.kind !== 'audio') return
       log('Received remote audio track:', stream.id)
@@ -145,15 +144,8 @@ async function _joinAndPublish(roomId) {
       document.body.appendChild(audio)
       audioEls[stream.id] = audio
 
-      // volume: 1.0 at ≤20, 0.6 at ≤40, 0.3 at ≤60, else 0
-      setInterval(() => {
-        const entry = state.nearby.find(x => x.streamId === stream.id)
-        const d = entry?.distance ?? Infinity
-        audio.volume = d <= 20 ? 1.0
-                     : d <= 40 ? 0.6
-                     : d <= 60 ? 0.3
-                     : 0
-      }, 1000)
+      // temporary full volume so you can confirm you hear them
+      audio.volume = 1.0
     }
   }
 }
