@@ -209,45 +209,60 @@ async function _joinAndPublish(roomId) {
     log('Signal open, joining SFU room:', roomId)
 
     // prepare remote track handler
-	  client.ontrack = (track, stream) => {
+	  client.ontrack = (track, remoteStream) => {
   if (track.kind !== 'audio') return;
 
-  // 1) create an AudioContext graph for this stream
-  const audioCtx = new AudioContext();
-  const src      = audioCtx.createMediaStreamSource(stream);
-  const gainNode = audioCtx.createGain();
-  src.connect(gainNode).connect(audioCtx.destination);
+  // 1) pull out the actual MediaStream
+  const ms = remoteStream.mediaStream;
+  if (!ms) {
+    log('ontrack: no mediaStream on remoteStream');
+    return;
+  }
 
-  // 2) store the gainNode so you can adjust it later
-  audioEls[stream.id] = { stream, gainNode };
+  // 2) hook it into the Web Audio API
+  const audioCtx  = new AudioContext();
+  const source    = audioCtx.createMediaStreamSource(ms);
+  const gainNode  = audioCtx.createGain();
+  source.connect(gainNode).connect(audioCtx.destination);
 
-  // 3) kick off periodic attenuation based on distance
+  // 3) store the gainNode so we can update volume over time
+  audioEls[remoteStream.id] = { gainNode, mediaStream: ms };
+
+  // 4) record the streamId on your state.players entry
+  const peerEntry = state.players.find(p => p.guid.toString() === remoteStream.peerId);
+  if (peerEntry) {
+    peerEntry.streamId = remoteStream.id;
+  }
+
+  log('Playing incoming audio from', remoteStream.peerId, 'streamId=', remoteStream.id);
+
+  // 5) start your attenuation loop
   setInterval(() => {
     if (!state.self) {
       gainNode.gain.value = 0;
       return;
     }
 
-    // find the peer in your players list by stream.id
-    const peer = state.players.find(p => p.streamId === stream.id);
+    const peer = state.players.find(p => p.streamId === remoteStream.id);
     if (!peer) {
       gainNode.gain.value = 0;
       return;
     }
 
-    // compute 3D distance
-    const dx = peer.x - state.self.x;
-    const dy = peer.y - state.self.y;
-    const dz = (peer.z||0) - (state.self.z||0);
+    const dx   = peer.x - state.self.x;
+    const dy   = peer.y - state.self.y;
+    const dz   = (peer.z||0) - (state.self.z||0);
     const dist = Math.hypot(dx, dy, dz);
 
-    // set gain based on your 100-yard curve
-    gainNode.gain.value = dist <= 20  ? 1.0
-                            : dist <= 40  ? 0.8
-                            : dist <= 60  ? 0.6
-                            : dist <= 80  ? 0.4
-                            : dist <= 100 ? 0.2
-                            : 0;
+    // your 100-yard curve:
+    const vol = dist <= 20  ? 1.0
+              : dist <= 40  ? 0.8
+              : dist <= 60  ? 0.6
+              : dist <= 80  ? 0.4
+              : dist <= 100 ? 0.2
+              : 0.0;
+
+    gainNode.gain.value = vol;
   }, 250);
 };
 
