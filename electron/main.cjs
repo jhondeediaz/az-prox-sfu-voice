@@ -5,7 +5,7 @@ function createWindow() {
   const win = new BrowserWindow({
 	  width: 360,
     height: 320,
-    resizable: false,
+    resizable: true,
     title: 'AzerothFunkProximityVoice',
     webPreferences: {
       nodeIntegration: true,

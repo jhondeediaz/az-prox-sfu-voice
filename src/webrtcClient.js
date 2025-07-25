@@ -1,174 +1,143 @@
-import { IonSFUJSONRPCSignal, SFUClient } from "ion-sdk-js";
+import { IonSFUJSONRPCSignal } from 'ion-sdk-js/lib/signal/json-rpc-impl'
+import SFUClient from 'ion-sdk-js/lib/client'
 
-const PROXIMITY_WS = import.meta.env.VITE_PROXIMITY_WS;
-const SFU_WS = import.meta.env.VITE_SFU_WS;
+const PROXIMITY_WS = import.meta.env.VITE_PROXIMITY_WS
+const SFU_WS = import.meta.env.VITE_SFU_WS
 
-export const DEBUG = true;
+export const DEBUG = true
 
-let client;
-let signal;
-let localStream;
-let currentRoom = null;
-let proximitySocket = null;
-let guid = null;
-let state = {
-  self: null,
-  nearby: [],
+let guid = null
+let signal = null
+let client = null
+let proximitySocket = null
+let localStream = null
+let currentRoom = null
+let audioElements = {}
+
+const state = {
   players: [],
-};
-
-const audioElements = {};
+  nearby: [],
+  self: null
+}
 
 function log(...args) {
-  if (DEBUG) console.log(...args);
+  if (DEBUG) console.log('[WebRTC]', ...args)
 }
 
 export function setGuid(newGuid) {
-  guid = Number(newGuid);
-  localStorage.setItem("guid", guid);
-  log("Set GUID:", guid);
+  guid = Number(newGuid)
+  localStorage.setItem('guid', guid)
+  log('Set GUID:', guid)
 }
 
-export function getNearbyPlayers() {
-  return state.nearby;
+export function reconnectSocket() {
+  connectProximitySocket()
 }
 
-function distance(a, b) {
-  const dx = a.x - b.x;
-  const dy = a.y - b.y;
-  return Math.sqrt(dx * dx + dy * dy);
+export function initWebRTC() {
+  connectProximitySocket()
 }
 
-function getMapRoom(mapId) {
-  return `map-${mapId}`;
-}
+function connectProximitySocket() {
+  if (proximitySocket) proximitySocket.close()
 
-export function connectProximitySocket() {
-  if (!guid) {
-    log("GUID not set, cannot connect to proximity socket.");
-    return;
-  }
+  proximitySocket = new WebSocket(PROXIMITY_WS)
 
-  if (proximitySocket) {
-    proximitySocket.close();
-  }
+  proximitySocket.addEventListener('open', () => {
+    log('Connected to proximity server.')
+  })
 
-proximitySocket = new WebSocket(PROXIMITY_WS);
-
-  proximitySocket.addEventListener("open", () => {
-    log("Connected to proximity server.");
-  });
-
-  proximitySocket.addEventListener("message", (event) => {
+  proximitySocket.addEventListener('message', (event) => {
     try {
-      const data = JSON.parse(event.data);
-      const players = Array.isArray(data) ? data : [data];
-      state.players = players;
+      const player = JSON.parse(event.data)
+      if (!player?.guid) return
 
-      const self = players.find((p) => p.guid === guid);
-      if (!self) return;
-
-      state.self = self;
-
-      const nearby = players
-        .filter((p) => p.guid !== guid && p.map === self.map)
-        .filter((p) => distance(p, self) <= 60);
-
-      if (getMapRoom(self.map) !== currentRoom) {
-        joinRoom(getMapRoom(self.map));
+      const isSelf = player.guid === guid
+      if (isSelf) {
+        state.self = player
+      } else {
+        const existing = state.players.find(p => p.guid === player.guid)
+        if (existing) Object.assign(existing, player)
+        else state.players.push(player)
       }
 
-      state.nearby = nearby;
-
-      // Proximity logging
-      for (const player of nearby) {
-        const dx = player.x - self.x;
-        const dy = player.y - self.y;
-        const dist = Math.sqrt(dx * dx + dy * dy);
-        if (dist < 40) {
-          log(`Player ${player.guid} is nearby (${dist.toFixed(1)} yards)`);
-        }
-      }
+      updateNearbyPlayers()
     } catch (err) {
-      log("Error parsing player data:", err);
+      log('Error parsing player data:', err)
     }
-  });
+  })
 
-  proximitySocket.addEventListener("close", () => {
-    log("Proximity socket closed. Reconnecting...");
-    setTimeout(connectProximitySocket, 2000);
-  });
+  proximitySocket.addEventListener('close', () => {
+    log('Proximity socket closed. Reconnecting...')
+    setTimeout(connectProximitySocket, 2000)
+  })
 
-  proximitySocket.addEventListener("error", (err) => {
-    log("Proximity socket error:", err);
-  });
+  proximitySocket.addEventListener('error', err => {
+    log('Proximity socket error:', err)
+  })
+}
+
+function updateNearbyPlayers() {
+  const self = state.self
+  if (!self) return
+
+  const nearby = state.players
+    .filter(p => p.guid !== guid && p.map === self.map)
+    .map(p => {
+      const dx = p.x - self.x
+      const dy = p.y - self.y
+      const dist = Math.sqrt(dx * dx + dy * dy)
+      return { ...p, distance: dist }
+    })
+    .filter(p => p.distance <= 60)
+
+  state.nearby = nearby
+
+  if (getRoomName(self.map) !== currentRoom) {
+    joinRoom(getRoomName(self.map))
+  }
+}
+
+function getRoomName(mapId) {
+  return `map-${mapId}`
 }
 
 export async function joinRoom(roomId) {
   if (roomId === currentRoom) return;
-
   currentRoom = roomId;
   log(`Switching to room: ${roomId}`);
 
   if (client) {
-    try {
-      await client.close();
-    } catch (e) {
-      log("Failed to close previous client:", e);
-    }
+    try { await client.close() }
+    catch (e) { log('close error', e) }
+    client = null;
   }
 
   signal = new IonSFUJSONRPCSignal(SFU_WS);
   client = new SFUClient(signal);
 
   signal.onopen = async () => {
-    log("Signal connected. Joining SFU room:", roomId);
+    log('Signal connected. Joining SFU room:', roomId);
 
-    try {
-      localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-      await client.join(roomId, localStream);
+    // 1) get your mic
+    localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
 
-      client.ontrack = (track, stream) => {
-        if (track.kind === "audio") {
-          const audio = new Audio();
-          audio.srcObject = stream;
-          audio.autoplay = true;
-          audio.play();
+    // 2) join with GUID *as a string* in the correct spot
+    await client.join(roomId, guid.toString(), localStream);
 
-          audioElements[stream.id] = audio;
-          log("Playing remote audio stream");
-
-          setInterval(() => {
-            const target = state.nearby.find((p) => p.streamId === stream.id);
-            if (!target || !state.self) return;
-
-            const dist = distance(target, state.self);
-            let volume = 0;
-
-            if (dist <= 20) volume = 1.0;
-            else if (dist <= 40) volume = 0.6;
-            else if (dist <= 60) volume = 0.3;
-
-            audio.volume = volume;
-          }, 1000);
-        }
-      };
-    } catch (err) {
-      log("Error joining room:", err);
-    }
+    client.ontrack = (track, stream) => {
+      if (track.kind === 'audio') {
+        const audio = new Audio();
+        audio.srcObject = stream;
+        audio.autoplay = true;
+        document.body.appendChild(audio);
+        audioElements[stream.id] = audio;
+        log('Playing remote audio');
+      }
+    };
   };
 }
 
-// Restore GUID from localStorage on startup
-const savedGuid = localStorage.getItem("guid");
-if (savedGuid) setGuid(savedGuid);
-
-
-export function reconnectSocket() {
-  connectProximitySocket();
-}
-
-export function setGuidFromInput(input) {
-  setGuid(input);
-  connectProximitySocket();
+export function getNearbyPlayers() {
+  return state.nearby;
 }
