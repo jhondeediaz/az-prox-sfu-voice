@@ -118,6 +118,33 @@ export function connectProximitySocket() {
 
     // 3) recompute nearby + maybe join room
     _updateNearby()
+updateAllVolumes();
+  }
+}
+
+// call this once per proximity update
+function updateAllVolumes() {
+  if (!state.self) return;
+
+  for (const peer of state.players) {
+    const peerId = peer.guid.toString();
+    const audio  = audioEls[peerId];
+    if (!audio) continue;  
+
+    // compute 3D distance
+    const dx   = peer.x - state.self.x;
+    const dy   = peer.y - state.self.y;
+    const dz   = (peer.z||0) - (state.self.z||0);
+    const dist = Math.hypot(dx, dy, dz);
+
+    // linear fade 0→100 yd
+    let vol = 1 - (dist / 100);
+    if (vol < 0) vol = 0;
+    audio.volume = vol;
+
+    console.log(
+      `[webrtc] volume[${peerId}] = ${vol.toFixed(2)} for ${dist.toFixed(1)}yd`
+    );
   }
 }
 
@@ -220,41 +247,20 @@ function computeVolume(dist) {
 client.ontrack = (track, remoteStream) => {
   if (track.kind !== 'audio') return;
 
-  const peerId = remoteStream.peerId;  // this is your GUID string
+  const peerId = remoteStream.peerId.toString();
+  console.log('[webrtc] attaching audio for peer', peerId);
 
-  console.log('[webrtc] ontrack for peer', peerId);
-
-  // Create a hidden <audio> element
+  // create & play, no controls, visible or not—doesn’t matter
   const audio = new Audio();
   audio.srcObject = remoteStream.mediaStream || remoteStream;
   audio.autoplay = true;
-  audio.controls = false;
-  audio.style.display = 'none';
   document.body.appendChild(audio);
-
-  // Store it by peerId for quick lookup
+  
+  // store by peerId so we can update its volume later
   audioEls[peerId] = audio;
 
-  // Start a small loop to attenuate by distance
-  setInterval(() => {
-    const me   = state.self;
-    const peer = state.players.find(p => p.guid.toString() === peerId);
-
-    if (!me || !peer) {
-      audio.volume = 0;
-      return;
-    }
-
-    const dx   = peer.x - me.x;
-    const dy   = peer.y - me.y;
-    const dz   = (peer.z || 0) - (me.z || 0);
-    const dist = Math.hypot(dx, dy, dz);
-
-    const vol = computeVolume(dist);
-    audio.volume = vol;
-    // debugging log:
-    console.log(`[webrtc] set vol=${vol.toFixed(2)} for ${peerId} @ ${dist.toFixed(1)}yd`);
-  }, 250);
+  // start at full volume
+  audio.volume = 1.0;
 };
 
     // get mic & join+publish
