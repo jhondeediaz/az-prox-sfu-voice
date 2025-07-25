@@ -1,143 +1,166 @@
 import { IonSFUJSONRPCSignal } from 'ion-sdk-js/lib/signal/json-rpc-impl'
-import SFUClient from 'ion-sdk-js/lib/client'
+import { Client, LocalStream }       from 'ion-sdk-js'
 
 const PROXIMITY_WS = import.meta.env.VITE_PROXIMITY_WS
-const SFU_WS = import.meta.env.VITE_SFU_WS
+const SFU_WS       = import.meta.env.VITE_SFU_WS
 
 export const DEBUG = true
 
-let guid = null
-let signal = null
-let client = null
+let guid            = null
 let proximitySocket = null
-let localStream = null
-let currentRoom = null
-let audioElements = {}
-
-const state = {
-  players: [],
-  nearby: [],
-  self: null
-}
+let manuallyClosed  = false
+let signal          = null
+let client          = null
+let localStream     = null
+let currentRoom     = null
+const audioEls      = {}
+const state         = { self: null, players: [], nearby: [] }
 
 function log(...args) {
-  if (DEBUG) console.log('[WebRTC]', ...args)
+  if (DEBUG) console.log('[webrtc]', ...args)
 }
 
-export function setGuid(newGuid) {
-  guid = Number(newGuid)
+// ————— API for App.vue —————
+export function setGuid(id) {
+  guid = id.toString()
   localStorage.setItem('guid', guid)
-  log('Set GUID:', guid)
+  log('GUID set to', guid)
+}
+
+export function getNearbyPlayers() {
+  return state.nearby
 }
 
 export function reconnectSocket() {
-  connectProximitySocket()
-}
-
-export function initWebRTC() {
-  connectProximitySocket()
-}
-
-function connectProximitySocket() {
+  manuallyClosed = true
   if (proximitySocket) proximitySocket.close()
+  manuallyClosed = false
+  connectProximitySocket()
+}
+
+// ————— Proximity socket + reconnection —————
+export function connectProximitySocket() {
+  if (!guid) {
+    log('GUID not set; cannot open proximity socket.')
+    return
+  }
+
+  // already open/connecting?
+  if (
+    proximitySocket &&
+    (proximitySocket.readyState === WebSocket.OPEN ||
+     proximitySocket.readyState === WebSocket.CONNECTING)
+  ) {
+    log('Proximity socket already open or connecting.')
+    return
+  }
 
   proximitySocket = new WebSocket(PROXIMITY_WS)
 
-  proximitySocket.addEventListener('open', () => {
-    log('Connected to proximity server.')
-  })
-
-  proximitySocket.addEventListener('message', (event) => {
-    try {
-      const player = JSON.parse(event.data)
-      if (!player?.guid) return
-
-      const isSelf = player.guid === guid
-      if (isSelf) {
-        state.self = player
-      } else {
-        const existing = state.players.find(p => p.guid === player.guid)
-        if (existing) Object.assign(existing, player)
-        else state.players.push(player)
-      }
-
-      updateNearbyPlayers()
-    } catch (err) {
-      log('Error parsing player data:', err)
+  proximitySocket.onopen  = () => log('Connected to proximity server')
+  proximitySocket.onerror = e  => log('Proximity socket error', e)
+  proximitySocket.onclose = () => {
+    log('Proximity socket closed')
+    if (!manuallyClosed) {
+      log('Reconnecting in 2s…')
+      setTimeout(connectProximitySocket, 2000)
     }
-  })
+  }
 
-  proximitySocket.addEventListener('close', () => {
-    log('Proximity socket closed. Reconnecting...')
-    setTimeout(connectProximitySocket, 2000)
-  })
+  proximitySocket.onmessage = ({ data }) => {
+    let p
+    try { p = JSON.parse(data) }
+    catch (e) { return log('Bad proximity JSON', e) }
 
-  proximitySocket.addEventListener('error', err => {
-    log('Proximity socket error:', err)
-  })
+    if (p.guid.toString() === guid) {
+      state.self = p
+    } else {
+      const idx = state.players.findIndex(x => x.guid === p.guid)
+      if (idx >= 0) state.players[idx] = p
+      else           state.players.push(p)
+    }
+
+    _updateNearby()
+  }
 }
 
-function updateNearbyPlayers() {
-  const self = state.self
-  if (!self) return
+// ————— Proximity → SFU logic —————
+function _updateNearby() {
+  const me = state.self
+  if (!me) return
 
   const nearby = state.players
-    .filter(p => p.guid !== guid && p.map === self.map)
+    .filter(p => p.map === me.map && p.guid !== guid)
     .map(p => {
-      const dx = p.x - self.x
-      const dy = p.y - self.y
-      const dist = Math.sqrt(dx * dx + dy * dy)
-      return { ...p, distance: dist }
+      const dx = p.x - me.x
+      const dy = p.y - me.y
+      const dz = (p.z||0) - (me.z||0)
+      return { ...p, distance: Math.hypot(dx, dy, dz) }
     })
     .filter(p => p.distance <= 60)
 
   state.nearby = nearby
 
-  if (getRoomName(self.map) !== currentRoom) {
-    joinRoom(getRoomName(self.map))
+  const room = `map-${me.map}`
+  if (nearby.length && room !== currentRoom) {
+    _joinAndPublish(room)
+    currentRoom = room
   }
 }
 
-function getRoomName(mapId) {
-  return `map-${mapId}`
-}
-
-export async function joinRoom(roomId) {
-  if (roomId === currentRoom) return;
-  currentRoom = roomId;
-  log(`Switching to room: ${roomId}`);
+// ————— Join SFU & publish mic —————
+async function _joinAndPublish(roomId) {
+  log('Switching to room:', roomId)
 
   if (client) {
     try { await client.close() }
-    catch (e) { log('close error', e) }
-    client = null;
+    catch (e) { log('Error closing old client', e) }
+    client = null
   }
 
-  signal = new IonSFUJSONRPCSignal(SFU_WS);
-  client = new SFUClient(signal);
+  signal = new IonSFUJSONRPCSignal(SFU_WS)
+  client = new Client(signal)
 
   signal.onopen = async () => {
-    log('Signal connected. Joining SFU room:', roomId);
+    log('Signal open, joining SFU room:', roomId)
 
-    // 1) get your mic
-    localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    // 1) get a LocalStream (wraps MediaStream so client.publish works)
+    localStream = await LocalStream.getUserMedia({ audio: true, video: false })
 
-    // 2) join with GUID *as a string* in the correct spot
-    await client.join(roomId, guid.toString(), localStream);
+    // 2) join with your GUID
+    await client.join(roomId, guid)
 
+    // 3) then publish your mic
+    await client.publish(localStream)
+    log('Published local stream')
+
+    // 4) handle incoming audio and volume fall-off
     client.ontrack = (track, stream) => {
-      if (track.kind === 'audio') {
-        const audio = new Audio();
-        audio.srcObject = stream;
-        audio.autoplay = true;
-        document.body.appendChild(audio);
-        audioElements[stream.id] = audio;
-        log('Playing remote audio');
-      }
-    };
-  };
+      if (track.kind !== 'audio') return
+      log('Received remote audio track:', stream.id)
+
+      const audio = new Audio()
+      audio.srcObject = stream
+      audio.autoplay = true
+      document.body.appendChild(audio)
+      audioEls[stream.id] = audio
+
+      // volume: 1.0 at ≤20, 0.6 at ≤40, 0.3 at ≤60, else 0
+      setInterval(() => {
+        const entry = state.nearby.find(x => x.streamId === stream.id)
+        const d = entry?.distance ?? Infinity
+        audio.volume = d <= 20 ? 1.0
+                     : d <= 40 ? 0.6
+                     : d <= 60 ? 0.3
+                     : 0
+      }, 1000)
+    }
+  }
 }
 
-export function getNearbyPlayers() {
-  return state.nearby;
+// ————— Auto-bootstrap on load —————
+const saved = localStorage.getItem('guid')
+if (saved) {
+  setGuid(saved)
+  connectProximitySocket()
 }
