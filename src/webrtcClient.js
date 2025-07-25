@@ -66,21 +66,20 @@ export function connectProximitySocket() {
     }
   }
 
-  proximitySocket.onmessage = ({ data }) => {
-    let p
-    try { p = JSON.parse(data) }
-    catch (e) { return log('Bad proximity JSON', e) }
+	proximitySocket.onmessage = ({ data }) => {
+  // Parse the incoming JSON array
+  const list = JSON.parse(data);  // e.g. [ {guid:2207,…}, {guid:2324,…} ]
 
-    if (p.guid.toString() === guid) {
-      state.self = p
-    } else {
-      const idx = state.players.findIndex(x => x.guid === p.guid)
-      if (idx >= 0) state.players[idx] = p
-      else           state.players.push(p)
-    }
+  // Find your own entry
+  const me = list.find(p => p.guid.toString() === guid);
+  if (me) state.self = me;
 
-    _updateNearby()
-  }
+  // Everybody else becomes your 'players' array
+  state.players = list.filter(p => p.guid.toString() !== guid);
+
+  // Now run your existing proximity logic to rebuild state.nearby and join rooms
+  _updateNearby();
+};
 }
 
 // ————— Proximity → SFU logic —————
