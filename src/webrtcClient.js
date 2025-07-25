@@ -67,19 +67,35 @@ export function connectProximitySocket() {
   }
 
 	proximitySocket.onmessage = ({ data }) => {
-  // Parse the incoming JSON array
-  const list = JSON.parse(data);  // e.g. [ {guid:2207,…}, {guid:2324,…} ]
+  // 1) Parse the full object: { mapId: [players], … }
+  const maps = JSON.parse(data);
 
-  // Find your own entry
-  const me = list.find(p => p.guid.toString() === guid);
-  if (me) state.self = me;
+  // 2) Locate your own packet across *all* maps
+  let selfPacket = null;
+  for (const [mapId, players] of Object.entries(maps)) {
+    const match = players.find(p => p.guid.toString() === guid);
+    if (match) {
+      selfPacket = match;
+      break;
+    }
+  }
+  if (!selfPacket) {
+    // you aren’t in that roster (yet), so nothing to do
+    return;
+  }
 
-  // Everybody else becomes your 'players' array
-  state.players = list.filter(p => p.guid.toString() !== guid);
+  // 3) Update your self state and remember your current map
+  state.self = selfPacket;
+  const currentMapId = selfPacket.map.toString();
 
-  // Now run your existing proximity logic to rebuild state.nearby and join rooms
+  // 4) Pull out *only* the players on your map, excluding you
+  const mapPlayers = maps[currentMapId] || [];
+  state.players = mapPlayers.filter(p => p.guid.toString() !== guid);
+
+  // 5) Re-run your proximity logic
   _updateNearby();
 };
+
 }
 
 // ————— Proximity → SFU logic —————
