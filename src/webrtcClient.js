@@ -16,7 +16,6 @@ let client          = null
 let localStream     = null
 let lastMapId       = null
 
-// tracks self + everybody on same map
 const state = { self: null, players: [] }
 // one hidden <audio> per peer
 const audioEls = {}  // peerGuid → HTMLAudioElement
@@ -26,7 +25,7 @@ function log(...args) {
 }
 
 /**
- * 1 yd → 1.0, 50 yd → 0.0, linear in between
+ * 1 yd → 1.0 volume, 50 yd → 0.0, linear in between
  */
 function computeVolume(dist) {
   if (dist <= 1)  return 1
@@ -42,7 +41,7 @@ export function setGuid(id) {
 }
 
 export async function resumeAudio() {
-  // no-op for <audio>
+  // no-op for plain <audio>
 }
 
 export function getNearbyPlayers() {
@@ -62,20 +61,21 @@ export function toggleDeafen(deafened) {
   log(`Deafen ${deafened ? 'on' : 'off'}`)
 }
 
-// ── PROXIMITY ───────────────────────────────────────────────────────────────
-function connectProximitySocket() {
+// ── PROXIMITY SOCKET ───────────────────────────────────────────────────────
+export function connectProximitySocket() {
   if (!guid) return log('GUID not set')
   if (proximitySocket &&
      (proximitySocket.readyState === WebSocket.OPEN ||
       proximitySocket.readyState === WebSocket.CONNECTING)) {
     return
   }
+
   proximitySocket = new WebSocket(PROXIMITY_WS)
   proximitySocket.onopen    = () => log('Proximity connected')
   proximitySocket.onerror   = e => log('Proximity error', e)
   proximitySocket.onmessage = handleProximity
   proximitySocket.onclose   = () => {
-    log('Proximity closed, retrying in 2s')
+    log('Proximity closed, retry in 2s')
     setTimeout(connectProximitySocket, 2000)
   }
 }
@@ -88,57 +88,60 @@ export function reconnectSocket() {
 export async function disconnectProximity() {
   proximitySocket?.close()
   proximitySocket = null
-  client?.close().catch(()=>{})
-  client = null
+  if (client) {
+    await client.close().catch(()=>{})
+    client = null
+  }
   Object.values(audioEls).forEach(a => a.muted = true)
+  log('Proximity disabled')
 }
 
-// update on each proximity message
+// ── HANDLE INCOMING PROXIMITY UPDATES ────────────────────────────────────
 async function handleProximity({ data }) {
   const maps = JSON.parse(data)
 
-  // 1) locate self
+  // 1) find self
   let me = null
   for (const arr of Object.values(maps)) {
-    const found = arr.find(p => p.guid.toString() === guid)
-    if (found) { me = found; break }
+    const f = arr.find(p => p.guid.toString() === guid)
+    if (f) { me = f; break }
   }
   if (!me) return
 
   state.self = me
   const mapId = me.map.toString()
 
-  // 2) list all others on same map + compute distance
+  // 2) build list of others with computed distance
   const others = (maps[mapId] || [])
     .filter(p => p.guid.toString() !== guid)
     .map(p => {
       const dx = p.x - me.x
       const dy = p.y - me.y
       const dz = (p.z||0) - (me.z||0)
-      return { guid: p.guid.toString(),
-               distance: Math.hypot(dx,dy,dz) }
+      return {
+        guid:     p.guid.toString(),
+        distance: Math.hypot(dx,dy,dz)
+      }
     })
 
   state.players = others
 
-  // 3) if map changed, join once
+  // 3) join SFU once per map
   if (mapId !== lastMapId) {
     lastMapId = mapId
     await joinAndPublish(`map-${mapId}`)
   }
 
-  // 4) adjust volume of every peer, but never drop out of the room
+  // 4) adjust volume on every hidden <audio>
   others.forEach(p => {
-    const audio = audioEls[p.guid]
-    if (audio) {
-      audio.volume = computeVolume(p.distance)
-    }
+    const a = audioEls[p.guid]
+    if (a) a.volume = computeVolume(p.distance)
   })
 }
 
 // ── SFU JOIN & PUBLISH ──────────────────────────────────────────────────────
 async function joinAndPublish(roomId) {
-  // tear down old
+  // tear down previous
   if (client) {
     await client.close().catch(e => log('SFU close error', e))
     client = null
@@ -146,24 +149,24 @@ async function joinAndPublish(roomId) {
   Object.values(audioEls).forEach(a => a.remove())
   Object.keys(audioEls).forEach(k => delete audioEls[k])
 
-  // new SFU client
   const signal = new IonSFUJSONRPCSignal(SFU_WS)
   client = new SFUClient(signal)
 
   signal.onopen = async () => {
-    log('Joining SFU', roomId)
+    log('Joining SFU room', roomId)
 
     client.ontrack = (track, remoteStream) => {
       if (track.kind !== 'audio') return
       const peerId = (remoteStream.peerId||remoteStream.id).toString()
-      log('ontrack for', peerId)
+      log('ontrack for peer', peerId)
+
       const a = new Audio()
-      a.dataset.peer = peerId
-      a.srcObject    = remoteStream.mediaStream||remoteStream
-      a.autoplay     = true
-      a.controls     = false
-      a.style.display= 'none'
-      a.volume       = 1
+      a.dataset.peer  = peerId
+      a.srcObject     = remoteStream.mediaStream||remoteStream
+      a.autoplay      = true
+      a.controls      = false
+      a.style.display = 'none'
+      a.volume        = 1
       document.body.appendChild(a)
       audioEls[peerId] = a
     }
@@ -182,7 +185,7 @@ async function joinAndPublish(roomId) {
   }
 }
 
-// ── AUTO‐BOOTSTRAP ─────────────────────────────────────────────────────────
+// ── AUTO-BOOTSTRAP ─────────────────────────────────────────────────────────
 const saved = localStorage.getItem('guid')
 if (saved) {
   setGuid(saved)
