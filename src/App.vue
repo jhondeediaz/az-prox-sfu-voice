@@ -88,8 +88,13 @@ function setGuidHandler() {
 
 // 2) toggle proximity on/off
 function toggleProximity() {
-  if (proximityEnabled.value) connectProximitySocket()
-  else                         disconnectProximity()
+  if (proximityEnabled.value) {
+    // first, unlock audio
+    resumeAudio();
+    connectProximitySocket();
+  } else {
+    disconnectProximity();
+  }
 }
 
 // 3) toggle mute (mic only)

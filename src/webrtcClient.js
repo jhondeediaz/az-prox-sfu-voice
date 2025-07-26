@@ -20,7 +20,7 @@ let lastSelfMapId   = null
 let currentRoom     = null
 
 const state    = { self: null, players: [], nearby: [] }
-const audioEls = {}   // peerId → PannerNode wrapper
+const audioEls = {}   // peerId → { panner: PannerNode }
 
 // ── AUDIO CONTEXT ─────────────────────────────────────────────────────────
 const audioCtx = new AudioContext()
@@ -38,12 +38,13 @@ function computeVolume(dist) {
 
 function update3DPositions() {
   if (!state.self) return
-  // Update listener position
+
+  // move listener to your position
   audioCtx.listener.positionX.setValueAtTime(state.self.x, audioCtx.currentTime)
   audioCtx.listener.positionY.setValueAtTime(state.self.y, audioCtx.currentTime)
   audioCtx.listener.positionZ.setValueAtTime(state.self.z || 0, audioCtx.currentTime)
 
-  // Update each peer’s panner
+  // move each peer’s panner
   for (const p of state.players) {
     const entry = audioEls[p.guid.toString()]
     if (!entry) continue
@@ -61,34 +62,29 @@ export function setGuid(id) {
 }
 
 export function resumeAudio() {
-  audioCtx.resume()
-    .then(() => log('AudioContext resumed'))
-    .catch(err => log('Audio resume error', err))
+  if (audioCtx.state === 'suspended') {
+    audioCtx.resume()
+      .then(() => log('AudioContext resumed'))
+      .catch(err => log('Audio resume error', err))
+  }
 }
 
 export function getNearbyPlayers() {
   return state.nearby
 }
 
-// Mute/unmute mic
 export function toggleMute(shouldMute) {
   if (!localStream) return log('Cannot mute: no localStream')
   const ms = localStream.mediaStream || localStream.stream || localStream
   if (!ms) return log('Cannot mute: no MediaStream')
-  ms.getAudioTracks().forEach(t => (t.enabled = !shouldMute))
+  ms.getAudioTracks().forEach(t => t.enabled = !shouldMute)
   log(`Microphone ${shouldMute ? 'muted' : 'unmuted'}`)
 }
 
-// Deafen = mute mic + incoming
 export function toggleDeafen(shouldDeafen) {
-  // Mute outgoing
   toggleMute(shouldDeafen)
-  // Mute all incoming
   Object.values(audioEls).forEach(e => {
-    if (e.panner) {
-      // simplest: reduce volume to 0 via panner refDistance hack
-      e.panner.refDistance = shouldDeafen ? Infinity : 1
-    }
+    if (e.panner) e.panner.refDistance = shouldDeafen ? Infinity : 1
   })
   log(`Deafen ${shouldDeafen ? 'on' : 'off'}`)
 }
@@ -97,8 +93,8 @@ export function toggleDeafen(shouldDeafen) {
 export function connectProximitySocket() {
   if (!guid) return log('Cannot connect: GUID not set')
   if (proximitySocket &&
-      (proximitySocket.readyState === WebSocket.OPEN ||
-       proximitySocket.readyState === WebSocket.CONNECTING)) {
+     (proximitySocket.readyState === WebSocket.OPEN ||
+      proximitySocket.readyState === WebSocket.CONNECTING)) {
     return log('Proximity socket already open/connecting')
   }
 
@@ -117,7 +113,7 @@ export function connectProximitySocket() {
     const maps = JSON.parse(data)
     log('got maps payload →', maps)
 
-    // Find self
+    // find self
     let selfPkt = null
     for (const arr of Object.values(maps)) {
       const f = arr.find(p => p.guid.toString() === guid)
@@ -125,19 +121,17 @@ export function connectProximitySocket() {
     }
     if (!selfPkt) return log('No self entry yet')
 
-    // Update state.self + players
-    state.self    = selfPkt
-    const roomKey = selfPkt.map.toString()
-    const arr     = maps[roomKey] || []
-    state.players = arr.filter(p => p.guid.toString() !== guid)
+    state.self = selfPkt
+    const roomKey    = selfPkt.map.toString()
+    const allPlayers = maps[roomKey] || []
+    state.players   = allPlayers.filter(p => p.guid.toString() !== guid)
     log(`players on map ${roomKey} →`, state.players)
 
-    // Move listener & panners in 3D
     update3DPositions()
 
-    // Recompute nearby list
     state.nearby = state.players
-      .map(p => ({ ...p,
+      .map(p => ({
+        ...p,
         distance: Math.hypot(
           p.x - state.self.x,
           p.y - state.self.y,
@@ -147,7 +141,6 @@ export function connectProximitySocket() {
       .filter(p => p.distance <= 60)
     log('state.nearby →', state.nearby)
 
-    // Auto-join SFU room
     _maybeJoinRoom()
   }
 }
@@ -181,32 +174,26 @@ async function _joinAndPublish(roomId) {
   signal.onopen = async () => {
     log('Signal open → joining SFU room:', roomId)
 
-    // Raw fallback handler (uncomment to test raw <audio>):
-    // client.ontrack = (track, remoteStream) => {
-    //   if (track.kind !== 'audio') return
-    //   console.log('[webrtc] raw ontrack')
-    //   const a = new Audio()
-    //   a.srcObject = remoteStream.mediaStream || remoteStream
-    //   a.autoplay = true
-    //   a.controls = true
-    //   document.body.appendChild(a)
-    // }
-
-    // PannerNode handler
     client.ontrack = (track, remoteStream) => {
       if (track.kind !== 'audio') return
       const peerId = (remoteStream.peerId || remoteStream.id).toString()
-      log('🔊 ontrack for peer', peerId)
+      log('🔊 spatial ontrack for peer', peerId)
 
-      const ms     = remoteStream.mediaStream || remoteStream
-      const src    = audioCtx.createMediaStreamSource(ms)
-      const pan    = audioCtx.createPanner()
+      if (audioCtx.state === 'suspended') {
+        audioCtx.resume().catch(console.error)
+      }
+
+      const ms  = remoteStream.mediaStream || remoteStream
+      const src = audioCtx.createMediaStreamSource(ms)
+      const pan = audioCtx.createPanner()
       pan.panningModel  = 'HRTF'
       pan.distanceModel = 'inverse'
       pan.refDistance   = 1
       pan.maxDistance   = 100
       pan.rolloffFactor = 1
-      src.connect(pan).connect(audioCtx.destination)
+
+      src.connect(pan)
+      pan.connect(audioCtx.destination)
 
       audioEls[peerId] = { panner: pan }
     }
@@ -214,7 +201,7 @@ async function _joinAndPublish(roomId) {
     try {
       localStream = await LocalStream.getUserMedia({ audio: true, video: false })
       await client.join(roomId, guid)
-      log('✅ joined SFU room', roomId, 'as GUID=', guid)
+      log('✅ joined room', roomId, 'as GUID=', guid)
       await client.publish(localStream)
       log('🎤 published local stream')
     } catch (err) {
@@ -224,17 +211,20 @@ async function _joinAndPublish(roomId) {
   }
 }
 
-function _maybeJoinRoom() {
+async function _maybeJoinRoom() {
   if (!state.self) return
   const room = `map-${state.self.map}`
 
   if (state.self.map !== lastSelfMapId) {
     lastSelfMapId = state.self.map
-    _joinAndPublish(room).then(() => (currentRoom = room))
+    await _joinAndPublish(room)
+    currentRoom = room
     return
   }
+
   if (state.players.some(p => p.distance <= 60) && room !== currentRoom) {
-    _joinAndPublish(room).then(() => (currentRoom = room))
+    await _joinAndPublish(room)
+    currentRoom = room
   }
 }
 
