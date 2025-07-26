@@ -53,7 +53,6 @@ import {
   setGuid,
   resumeAudio,
   reconnectSocket,
-  connectProximitySocket,
   toggleMute,
   toggleDeafen,
   getNearbyPlayers
@@ -65,29 +64,28 @@ const muted          = ref(false)
 const deafened       = ref(false)
 const nearbyPlayers  = ref([])
 
-// Called when the user enters their GUID
+// Called when user enters GUID
 async function setGuidHandler() {
   if (!guidInput.value) return
 
   setGuid(guidInput.value)
   guidSet.value = true
 
-  // Unlock audio context so playback + mic work
+  // unlock audio context for playback & mic
   await resumeAudio()
 
-  // Kick off our socket+SFU logic
+  // start the proximity → SFU flow
   reconnectSocket()
-  connectProximitySocket()
 }
 
-// Clicking “Change GUID” resets everything
+// Reset everything to prompt for a new GUID
 function resetGuid() {
   guidSet.value = false
-  // (you could also clear localStorage here if desired)
+  localStorage.removeItem('guid')
 }
 
 // Mute/unmute mic only.
-// If un‐muting while still deafened, we clear “deafened”
+// If they un‐mute while still deafened, clear deafen.
 function toggleMuteHandler() {
   toggleMute(muted.value)
   if (!muted.value && deafened.value) {
@@ -96,23 +94,22 @@ function toggleMuteHandler() {
   }
 }
 
-// Deafen = mic + speakers.
-// Toggling deafened also forces muted checkbox on/off
+// Deafen = mute mic + silence all incoming.
+// Toggling deafen also forces the mic‐mute checkbox.
 function toggleDeafenHandler() {
   toggleDeafen(deafened.value)
-  muted.value = deafened.value
+  if (deafened.value) {
+    muted.value = true
+  }
 }
 
-// On mount, if we already had a GUID saved, re‐hydrate
 onMounted(() => {
   const saved = localStorage.getItem('guid')
   if (saved) {
     setGuid(saved)
     guidSet.value = true
-    resumeAudio().then(() => {
-      reconnectSocket()
-      connectProximitySocket()
-    })
+    // unlock & reconnect
+    resumeAudio().then(reconnectSocket)
   }
 
   // keep the debug list up to date
