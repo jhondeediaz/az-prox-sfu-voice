@@ -53,6 +53,7 @@ import {
   setGuid,
   resumeAudio,
   reconnectSocket,
+  disconnectProximity,
   toggleMute,
   toggleDeafen,
   getNearbyPlayers
@@ -64,52 +65,55 @@ const muted          = ref(false)
 const deafened       = ref(false)
 const nearbyPlayers  = ref([])
 
-// Called when user enters GUID
+// 1) User enters GUID
 async function setGuidHandler() {
   if (!guidInput.value) return
 
   setGuid(guidInput.value)
   guidSet.value = true
 
-  // unlock audio context and start SFU/proximity flow
+  // unlock audio
   await resumeAudio()
+
+  // start proximity + SFU flow
   reconnectSocket()
 }
 
-// Reset everything to prompt for a new GUID
+// 2) Reset GUID
 function resetGuid() {
   guidSet.value = false
   localStorage.removeItem('guid')
+  // clean up connections
+  disconnectProximity()
 }
 
-// Mute/unmute mic only.
-// If they un-mute while still deafened, clear deafen.
+// 3) Mute (mic only)
 function toggleMuteHandler() {
   toggleMute(muted.value)
+  // if unmuting while still deafened, clear deafen
   if (!muted.value && deafened.value) {
     deafened.value = false
     toggleDeafen(false)
   }
 }
 
-// Deafen = mute mic + silence all incoming.
-// Toggling deafen also forces the mic-mute checkbox.
+// 4) Deafen = mic + all incoming
 function toggleDeafenHandler() {
   toggleDeafen(deafened.value)
-  // mirror “deafened” into the mic‐muted checkbox
+  // always sync mute checkbox
   muted.value = deafened.value
 }
 
-// On mount, if we already had a GUID, rehydrate and reconnect
+// on mount, re-hydrate GUID + start
 onMounted(() => {
   const saved = localStorage.getItem('guid')
   if (saved) {
     setGuid(saved)
     guidSet.value = true
-    resumeAudio().then(reconnectSocket)
+    resumeAudio().then(() => reconnectSocket())
   }
 
-  // keep the debug list up to date
+  // refresh debug list
   setInterval(() => {
     nearbyPlayers.value = getNearbyPlayers()
   }, 1000)

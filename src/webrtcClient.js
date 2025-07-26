@@ -17,27 +17,28 @@ let localStream     = null
 let lastSelfMapId   = null
 let currentRoom     = null
 
-const state   = { self: null, players: [], nearby: [] }
-// raw <audio> elements, keyed by peerId
-const audioEls = {}
+// track your avatar + everybody else
+const state = { self: null, players: [], nearby: [] }
 
-// ── LOGGING ────────────────────────────────────────────────────────────────
+// fallback <audio> tags for raw playback
+const audioEls = {}  // peerId → HTMLAudioElement
+
 function log(...args) {
   if (DEBUG) console.log('[webrtc]', ...args)
 }
 
-// ── VOLUME CURVE ────────────────────────────────────────────────────────────
 /**
- * 100% volume for dist ≤ 20 yd, then drops by 1% per yard
- * → 0% at 120 yd
+ * 1 yd → 1.0, 50 yd → 0.0, clamp outside.
  */
-function computeVolume(dist) {
-  if (dist <= 20)   return 1.0
-  const v = 1 - ((dist - 20) * 0.01)
-  return Math.max(0, v)
+function computeVolumeByDistance(dist) {
+  if (dist <= 1) return 1.0
+  if (dist >= 50) return 0.0
+  // linear ramp from 1→50 yards: map [1,50] to [1,0]
+  return 1 - (dist - 1) / 49
 }
 
 // ── PUBLIC API ─────────────────────────────────────────────────────────────
+
 export function setGuid(id) {
   guid = id.toString()
   localStorage.setItem('guid', guid)
@@ -45,7 +46,7 @@ export function setGuid(id) {
 }
 
 export async function resumeAudio() {
-  // no-op; raw Audio elements start playing immediately
+  // no-op when you use plain <audio> elements
 }
 
 export function getNearbyPlayers() {
@@ -67,12 +68,14 @@ export function toggleDeafen(shouldDeafen) {
   log(`Deafen ${shouldDeafen ? 'on' : 'off'}`)
 }
 
-// ── PROXIMITY SOCKET ────────────────────────────────────────────────────────
+// ── PROXIMITY SOCKET ───────────────────────────────────────────────────────
+
 function connectProximitySocket() {
   if (!guid) return log('Cannot connect: GUID not set')
   if (proximitySocket &&
       (proximitySocket.readyState === WebSocket.OPEN ||
-       proximitySocket.readyState === WebSocket.CONNECTING)) {
+       proximitySocket.readyState === WebSocket.CONNECTING)
+  ) {
     return log('Proximity socket already open/connecting')
   }
 
@@ -80,49 +83,10 @@ function connectProximitySocket() {
   proximitySocket.onopen  = () => log('Connected to proximity server')
   proximitySocket.onerror = e  => log('Proximity socket error', e)
   proximitySocket.onclose = () => {
-    log('Proximity socket closed, silencing audio…')
-    // mute any lingering audio
-    Object.values(audioEls).forEach(a => a.muted = true)
+    log('Proximity socket closed — retry in 2s')
     setTimeout(connectProximitySocket, 2000)
   }
-  proximitySocket.onmessage = async ({ data }) => {
-    const maps = JSON.parse(data)
-    log('got proximity update →', maps)
-
-    // find our own packet
-    let me = null
-    for (const arr of Object.values(maps)) {
-      const f = arr.find(p => p.guid.toString() === guid)
-      if (f) { me = f; break }
-    }
-    if (!me) return
-
-    state.self    = me
-    const roomKey = me.map.toString()
-    const players = (maps[roomKey] || []).filter(p => p.guid.toString() !== guid)
-    state.players = players
-
-    // compute nearby array
-    state.nearby = players
-      .map(p => {
-        const dx = p.x - me.x, dy = p.y - me.y, dz = (p.z||0) - (me.z||0)
-        return { ...p, distance: Math.hypot(dx,dy,dz) }
-      })
-      .filter(p => p.distance <= 120)  // cap at 120 yd so computeVolume never goes negative
-    log('state.nearby →', state.nearby)
-
-    // join/publish if needed
-    await maybeJoinRoom()
-
-    // update volume on each audio element
-    state.nearby.forEach(p => {
-      const key = p.guid.toString()
-      const el  = audioEls[key]
-      if (el) {
-        el.volume = computeVolume(p.distance)
-      }
-    })
-  }
+  proximitySocket.onmessage = handleProximity
 }
 
 export function reconnectSocket() {
@@ -130,37 +94,94 @@ export function reconnectSocket() {
   connectProximitySocket()
 }
 
+export async function disconnectProximity() {
+  if (proximitySocket) proximitySocket.close()
+  proximitySocket = null
+  currentRoom     = null
+  if (client) {
+    await client.close().catch(e => log('SFU close error', e))
+    client = null
+  }
+  // mute any remnants
+  Object.values(audioEls).forEach(a => a.muted = true)
+}
+
+// ── PROXIMITY HANDLER ──────────────────────────────────────────────────────
+
+async function handleProximity({ data }) {
+  const maps = JSON.parse(data)
+  log('got proximity update →', maps)
+
+  // 1) find yourself
+  let me = null
+  for (const arr of Object.values(maps)) {
+    const f = arr.find(p => p.guid.toString() === guid)
+    if (f) { me = f; break }
+  }
+  if (!me) return
+
+  state.self = me
+  const roomKey = me.map.toString()
+  const playersAll = maps[roomKey] || []
+  state.players = playersAll.filter(p => p.guid.toString() !== guid)
+
+  // 2) build nearby list (for debug/UI)
+  state.nearby = state.players
+    .map(p => {
+      const dx = p.x - me.x, dy = p.y - me.y, dz = (p.z||0) - (me.z||0)
+      return { ...p, distance: Math.hypot(dx, dy, dz) }
+    })
+    .filter(p => p.distance <= 60)
+
+  // 3) maybe (re)join the SFU room
+  await maybeJoinRoom()
+
+  // 4) update every audioElt’s volume
+  Object.entries(audioEls).forEach(([peerId, audio]) => {
+    const found = state.players.find(x => x.guid.toString() === peerId)
+    audio.volume = found
+      ? computeVolumeByDistance(found.distance)
+      : 0
+  })
+}
+
 // ── SFU JOIN & PUBLISH ──────────────────────────────────────────────────────
+
 async function _joinAndPublish(roomId) {
-  // clean up any old client & audio
-  if (client) await client.close().catch(e=>log('SFU close error',e)), client = null
+  // clean up any old client + tags
+  if (client) {
+    await client.close().catch(e => log('SFU close error', e))
+    client = null
+  }
   Object.values(audioEls).forEach(a => a.remove())
   Object.keys(audioEls).forEach(k => delete audioEls[k])
 
-  // new SFU client
+  // spin up a fresh SFU client
   const signal = new IonSFUJSONRPCSignal(SFU_WS)
   client = new SFUClient(signal)
 
-  signal.onopen = async () => {
+  signal.onopen = () => {
     log('Signal open → joining SFU room:', roomId)
 
-    client.ontrack = async (track, remoteStream) => {
+    client.ontrack = (track, remoteStream) => {
       if (track.kind !== 'audio') return
-      const peerId = (remoteStream.peerId||remoteStream.id).toString()
+      const peerId = (remoteStream.peerId || remoteStream.id).toString()
       log('ontrack for peer', peerId)
 
-      // raw Audio fallback
+      // create a hidden <audio> element
       const a = new Audio()
       a.dataset.proxPeer = peerId
       a.srcObject        = remoteStream.mediaStream || remoteStream
       a.autoplay         = true
       a.controls         = false
       a.style.display    = 'none'
+      a.volume           = 1   // we'll clamp downstream
       document.body.appendChild(a)
-      audioEls[peerId] = a
+      audioEls[peerId]    = a
     }
 
-    try {
+    // now join & publish
+    ;(async () => {
       if (!localStream) {
         localStream = await LocalStream.getUserMedia({ audio: true, video: false })
       }
@@ -168,10 +189,10 @@ async function _joinAndPublish(roomId) {
       log('✅ joined room', roomId, 'as GUID=', guid)
       await client.publish(localStream)
       log('🎤 published local stream')
-    } catch (err) {
+    })().catch(err => {
       console.error('[webrtc] SFU error:', err)
-      currentRoom = roomId
-    }
+      currentRoom = roomId // avoid endless retries
+    })
   }
 }
 
@@ -179,21 +200,23 @@ async function maybeJoinRoom() {
   if (!state.self) return
   const room = `map-${state.self.map}`
 
-  // on map change always rejoin
+  // map change → always re-join
   if (state.self.map !== lastSelfMapId) {
     lastSelfMapId = state.self.map
     await _joinAndPublish(room)
     currentRoom = room
     return
   }
-  // if someone’s nearby and not in room yet
+
+  // someone nearby → join if not already
   if (state.nearby.length > 0 && room !== currentRoom) {
     await _joinAndPublish(room)
     currentRoom = room
   }
 }
 
-// ── AUTO‐BOOTSTRAP ─────────────────────────────────────────────────────────
+// ── AUTO-BOOTSTRAP ─────────────────────────────────────────────────────────
+
 const saved = localStorage.getItem('guid')
 if (saved) {
   setGuid(saved)
