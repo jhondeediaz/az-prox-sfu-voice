@@ -65,7 +65,7 @@ import {
   reconnectSocket,
   toggleMute,
   toggleDeafen,
-  onNearby
+  getNearbyPlayers
 } from './webrtcClient.js'
 
 // reactive state
@@ -114,10 +114,10 @@ onMounted(() => {
     if (proximityEnabled.value) connectProximitySocket()
   }
 
-  // whenever the module computes a new nearby list, update our ref
-  onNearby(list => {
-    nearbyPlayers.value = list
-  })
+   setInterval(() => {
+    nearbyPlayers.value = getNearbyPlayers()
+  }, 1000)
+
 })
 </script>
 
