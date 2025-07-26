@@ -165,53 +165,52 @@ export function disconnectProximity() {
 // ── SFU JOIN & PUBLISH ──────────────────────────────────────────────────────
 async function _joinAndPublish(roomId) {
   if (client) {
-    await client.close().catch(e => log('close error', e))
-    client = null
+    await client.close().catch(e => log('close error', e));
+    client = null;
   }
 
-  signal = new IonSFUJSONRPCSignal(SFU_WS)
-  client = new SFUClient(signal)
+  signal = new IonSFUJSONRPCSignal(SFU_WS);
+  client = new SFUClient(signal);
 
   signal.onopen = async () => {
-    log('Signal open → joining SFU room:', roomId)
+    log('Signal open → joining SFU room:', roomId);
 
+    // RAW AUDIO FALLBACK WITHOUT VISIBLE CONTROLS
     client.ontrack = (track, remoteStream) => {
-      if (track.kind !== 'audio') return
-      const peerId = (remoteStream.peerId || remoteStream.id).toString()
-      log('🔊 spatial ontrack for peer', peerId)
+      if (track.kind !== 'audio') return;
+      const peerId = (remoteStream.peerId || remoteStream.id).toString();
+      log('🔊 raw ontrack for peer', peerId);
 
-      // resume context
-      if (audioCtx.state === 'suspended') {
-        audioCtx.resume().catch(console.error)
-      }
+      const audio = new Audio();
+      audio.srcObject    = remoteStream.mediaStream || remoteStream;
+      audio.autoplay     = true;
+      audio.controls     = false;             // hide built-in controls
+      audio.style.display = 'none';           // remove from layout (or style as you like)
 
-      const ms     = remoteStream.mediaStream || remoteStream
-      const source = audioCtx.createMediaStreamSource(ms)
-      const pan    = audioCtx.createPanner()
-      pan.panningModel  = 'HRTF'
-      pan.distanceModel = 'inverse'
-      pan.refDistance   = 1
-      pan.maxDistance   = 100
-      pan.rolloffFactor = 1
-
-      source.connect(pan)
-      pan.connect(audioCtx.destination)
-
-      audioEls[peerId] = { panner: pan }
-    }
+      document.body.appendChild(audio);
+    };
 
     try {
-      localStream = await LocalStream.getUserMedia({ audio: true, video: false })
-      await client.join(roomId, guid)
-      log('✅ joined room', roomId, 'as GUID=', guid)
-      await client.publish(localStream)
-      log('🎤 published local stream')
+      // ensure we already have mic permission / localStream
+      if (!localStream) {
+        localStream = await LocalStream.getUserMedia({ audio: true, video: false });
+      }
+
+      await client.join(roomId, guid);
+      log('✅ joined room', roomId, 'as GUID=', guid);
+
+      await client.publish(localStream);
+      log('🎤 published local stream');
     } catch (err) {
-      console.error('[webrtc] SFU join/publish error:', err)
-      currentRoom = roomId
+      console.error('[webrtc] SFU join/publish error:', err);
+      currentRoom = roomId;  // avoid loops
     }
-  }
+  };
 }
+
+// The rest of your file (proximity socket, _maybeJoinRoom, auto‐bootstrap, etc.) remains unchanged.
+// This keeps the logic that watches `state.self.map` and `state.players` and calls `_joinAndPublish`
+// whenever you enter a new map or someone comes within 60 yards.
 
 async function _maybeJoinRoom() {
   if (!state.self) return
