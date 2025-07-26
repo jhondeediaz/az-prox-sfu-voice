@@ -60,25 +60,21 @@ export function getNearbyPlayers() {
   return state.nearby
 }
 
-// ── PUBLIC API ──
 export function toggleMute(shouldMute) {
-  if (!localStream) return;
-  const ms = localStream.mediaStream || localStream.stream || localStream;
-  if (!ms) return;
-  ms.getAudioTracks().forEach(t => (t.enabled = !shouldMute));
-  log(`Microphone ${shouldMute ? 'muted' : 'unmuted'}`);
+  if (!localStream) return
+  const ms = localStream.mediaStream || localStream.stream || localStream
+  ms.getAudioTracks().forEach(t => t.enabled = !shouldMute)
+  log(`Microphone ${shouldMute ? 'muted' : 'unmuted'}`)
 }
 
 export function toggleDeafen(shouldDeafen) {
-  // 1) Mute/unmute incoming
+  // mute/unmute incoming
   Object.values(audioNodes).forEach(({ gain }) => {
-    gain.gain.setValueAtTime(shouldDeafen ? 0 : 1, audioCtx.currentTime);
-  });
-
-  // 2) Also mute/unmute your mic
-  toggleMute(shouldDeafen);
-
-  log(`Deafen ${shouldDeafen ? 'on' : 'off'}`);
+    gain.gain.setValueAtTime(shouldDeafen ? 0 : 1, audioCtx.currentTime)
+  })
+  // mute/unmute mic
+  toggleMute(shouldDeafen)
+  log(`Deafen ${shouldDeafen ? 'on' : 'off'}`)
 }
 
 // ── PROXIMITY SOCKET ────────────────────────────────────────────────────────
@@ -114,7 +110,7 @@ export function connectProximitySocket() {
     }
     if (!selfPkt) return log('No self entry yet')
 
-    // 2) update state
+    // 2) update state.self & players
     state.self    = selfPkt
     const roomKey = selfPkt.map.toString()
     const arr     = maps[roomKey] || []
@@ -154,14 +150,14 @@ export function connectProximitySocket() {
 
 export function reconnectSocket() {
   manuallyClosed = true
-  if (proximitySocket) proximitySocket.close()
+  proximitySocket?.close()
   manuallyClosed = false
   connectProximitySocket()
 }
 
 export async function disconnectProximity() {
   manuallyClosed = true
-  if (proximitySocket) proximitySocket.close()
+  proximitySocket?.close()
   proximitySocket = null
   currentRoom     = null
   if (client) {
