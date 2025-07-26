@@ -20,7 +20,7 @@ let lastSelfMapId   = null
 let currentRoom     = null
 
 const state    = { self: null, players: [], nearby: [] }
-const audioEls = {}   // peerId → { panner: PannerNode }
+const audioEls = {}   // peerId → HTMLAudioElement
 
 // ── AUDIO CONTEXT ─────────────────────────────────────────────────────────
 const audioCtx = new AudioContext()
@@ -39,19 +39,11 @@ function computeVolume(dist) {
 function update3DPositions() {
   if (!state.self) return
 
-  // move listener to your avatar’s position
-  audioCtx.listener.positionX.setValueAtTime(state.self.x, audioCtx.currentTime)
-  audioCtx.listener.positionY.setValueAtTime(state.self.y, audioCtx.currentTime)
-  audioCtx.listener.positionZ.setValueAtTime(state.self.z || 0, audioCtx.currentTime)
-
-  // move each remote peer’s panner
-  for (const p of state.players) {
-    const entry = audioEls[p.guid.toString()]
-    if (!entry) continue
-    entry.panner.positionX.setValueAtTime(p.x, audioCtx.currentTime)
-    entry.panner.positionY.setValueAtTime(p.y, audioCtx.currentTime)
-    entry.panner.positionZ.setValueAtTime(p.z || 0, audioCtx.currentTime)
-  }
+  // update listener at our own coords
+  const { x, y, z = 0 } = state.self
+  audioCtx.listener.positionX.setValueAtTime(x, audioCtx.currentTime)
+  audioCtx.listener.positionY.setValueAtTime(y, audioCtx.currentTime)
+  audioCtx.listener.positionZ.setValueAtTime(z, audioCtx.currentTime)
 }
 
 // ── PUBLIC API ─────────────────────────────────────────────────────────────
@@ -61,11 +53,17 @@ export function setGuid(id) {
   log('GUID set to', guid)
 }
 
-export function resumeAudio() {
+export async function resumeAudio() {
   if (audioCtx.state === 'suspended') {
-    audioCtx.resume()
-      .then(() => log('AudioContext resumed'))
-      .catch(err => log('Audio resume error', err))
+    await audioCtx.resume()
+    log('AudioContext resumed')
+  }
+}
+
+export async function requestMic() {
+  if (!localStream) {
+    localStream = await LocalStream.getUserMedia({ audio: true, video: false })
+    log('Microphone granted')
   }
 }
 
@@ -82,10 +80,10 @@ export function toggleMute(shouldMute) {
 }
 
 export function toggleDeafen(shouldDeafen) {
+  // mute outgoing
   toggleMute(shouldDeafen)
-  Object.values(audioEls).forEach(e => {
-    if (e.panner) e.panner.refDistance = shouldDeafen ? Infinity : 1
-  })
+  // hide incoming by removing elements
+  Object.values(audioEls).forEach(a => { a.muted = shouldDeafen })
   log(`Deafen ${shouldDeafen ? 'on' : 'off'}`)
 }
 
@@ -113,7 +111,7 @@ export function connectProximitySocket() {
     const maps = JSON.parse(data)
     log('got maps payload →', maps)
 
-    // find self packet
+    // find our own packet
     let selfPkt = null
     for (const arr of Object.values(maps)) {
       const f = arr.find(p => p.guid.toString() === guid)
@@ -121,22 +119,24 @@ export function connectProximitySocket() {
     }
     if (!selfPkt) return log('No self entry yet')
 
-    // update state.self & state.players
-    state.self = selfPkt
-    const roomKey    = selfPkt.map.toString()
-    const allPlayers = maps[roomKey] || []
-    state.players   = allPlayers.filter(p => p.guid.toString() !== guid)
-    log(`players on map ${roomKey} →`, state.players)
+    // update state
+    state.self    = selfPkt
+    const roomKey = selfPkt.map.toString()
+    const players = (maps[roomKey] || []).filter(p => p.guid.toString() !== guid)
+    state.players = players
+    log(`players on map ${roomKey} →`, players)
 
+    // reposition listener & build 3D if you re-implement it
     update3DPositions()
 
-    state.nearby = state.players
+    // compute nearby
+    state.nearby = players
       .map(p => ({
         ...p,
         distance: Math.hypot(
-          p.x - state.self.x,
-          p.y - state.self.y,
-          (p.z||0) - (state.self.z||0)
+          p.x - selfPkt.x,
+          p.y - selfPkt.y,
+          (p.z||0) - (selfPkt.z||0)
         )
       }))
       .filter(p => p.distance <= 60)
@@ -153,49 +153,70 @@ export function reconnectSocket() {
   connectProximitySocket()
 }
 
-export function disconnectProximity() {
-  manuallyClosed = true
-  if (proximitySocket) proximitySocket.close()
-  proximitySocket = null
-  currentRoom     = null
-  if (client) { client.close().catch(()=>{}); client = null }
-  log('Proximity disabled')
+// ── PROXIMITY DISCONNECT ────────────────────────────────────────────────────
+export async function disconnectProximity() {
+  manuallyClosed = true;
+  if (proximitySocket) proximitySocket.close();
+  proximitySocket = null;
+  currentRoom     = null;
+  if (client) {
+    try {
+      await client.close();
+    } catch (err) {
+      log('Error closing SFU client during disconnect:', err);
+    }
+    client = null;
+  }
+  log('Proximity disabled');
 }
 
 // ── SFU JOIN & PUBLISH ──────────────────────────────────────────────────────
 async function _joinAndPublish(roomId) {
+  // 1) Clean up any existing client
   if (client) {
-    await client.close().catch(e => log('close error', e));
+    try {
+      await client.close();
+    } catch (err) {
+      log('Error closing previous client:', err);
+    }
     client = null;
   }
 
+  // remove any old <audio> tags
+  document.querySelectorAll('audio[data-prox-peer]').forEach(a => a.remove());
+  Object.keys(audioEls).forEach(k => delete audioEls[k]);
+
+  // 2) Create new Signal + Client
   signal = new IonSFUJSONRPCSignal(SFU_WS);
   client = new SFUClient(signal);
 
   signal.onopen = async () => {
     log('Signal open → joining SFU room:', roomId);
 
-    // RAW AUDIO FALLBACK WITHOUT VISIBLE CONTROLS
+    // raw fallback handler
     client.ontrack = (track, remoteStream) => {
       if (track.kind !== 'audio') return;
       const peerId = (remoteStream.peerId || remoteStream.id).toString();
       log('🔊 raw ontrack for peer', peerId);
 
       const audio = new Audio();
-      audio.srcObject    = remoteStream.mediaStream || remoteStream;
-      audio.autoplay     = true;
-      audio.controls     = false;             // hide built-in controls
-      audio.style.display = 'none';           // remove from layout (or style as you like)
-
+      audio.dataset.proxPeer = peerId;
+      audio.srcObject = remoteStream.mediaStream || remoteStream;
+      audio.autoplay   = true;
+      audio.controls   = false;
+      audio.style.display = 'none';
       document.body.appendChild(audio);
+
+      audioEls[peerId] = audio;
     };
 
     try {
-      // ensure we already have mic permission / localStream
+      // ensure mic
       if (!localStream) {
         localStream = await LocalStream.getUserMedia({ audio: true, video: false });
       }
 
+      // join & publish
       await client.join(roomId, guid);
       log('✅ joined room', roomId, 'as GUID=', guid);
 
@@ -203,29 +224,30 @@ async function _joinAndPublish(roomId) {
       log('🎤 published local stream');
     } catch (err) {
       console.error('[webrtc] SFU join/publish error:', err);
-      currentRoom = roomId;  // avoid loops
+      // prevent endless retry loops
+      currentRoom = roomId;
     }
   };
 }
 
-// The rest of your file (proximity socket, _maybeJoinRoom, auto‐bootstrap, etc.) remains unchanged.
-// This keeps the logic that watches `state.self.map` and `state.players` and calls `_joinAndPublish`
-// whenever you enter a new map or someone comes within 60 yards.
-
 async function _maybeJoinRoom() {
-  if (!state.self) return
-  const room = `map-${state.self.map}`
+  if (!state.self) return;
+  const newRoom = `map-${state.self.map}`;
 
+  // 1) if map changed, always re-join
   if (state.self.map !== lastSelfMapId) {
-    lastSelfMapId = state.self.map
-    await _joinAndPublish(room)
-    currentRoom = room
-    return
+    lastSelfMapId = state.self.map;
+    log('Map changed → joining', newRoom);
+    await _joinAndPublish(newRoom);
+    currentRoom = newRoom;
+    return;
   }
 
-  if (state.players.some(p => p.distance <= 60) && room !== currentRoom) {
-    await _joinAndPublish(room)
-    currentRoom = room
+  // 2) if someone’s nearby & not in room yet
+  if (state.nearby.length > 0 && newRoom !== currentRoom) {
+    log('Players nearby → joining', newRoom);
+    await _joinAndPublish(newRoom);
+    currentRoom = newRoom;
   }
 }
 

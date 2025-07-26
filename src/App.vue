@@ -60,6 +60,8 @@ import { ref, onMounted } from 'vue'
 import {
   DEBUG,
   setGuid,
+  resumeAudio,
+  requestMic,
   connectProximitySocket,
   disconnectProximity,
   reconnectSocket,
@@ -77,23 +79,31 @@ const deafened          = ref(false)
 const nearbyPlayers     = ref([])
 
 // 1) when user clicks OK, save GUID & start socket
-function setGuidHandler() {
+async function setGuidHandler() {
   if (!guidInput.value) return
+
+  // store guid
   setGuid(guidInput.value)
   guidSet.value = true
+
+  // prompt for mic permission, unlock AudioContext
+  await requestMic()
+  await resumeAudio()
+
+  // start proximity flow
   reconnectSocket()
-  // if the "Enable Proximity" box was already checked, kick it off
-  if (proximityEnabled.value) connectProximitySocket()
+  if (proximityEnabled.value) {
+    connectProximitySocket()
+  }
 }
 
 // 2) toggle proximity on/off
-function toggleProximity() {
+async function toggleProximity() {
   if (proximityEnabled.value) {
-    // first, unlock audio
     resumeAudio();
     connectProximitySocket();
   } else {
-    disconnectProximity();
+    await disconnectProximity();
   }
 }
 
@@ -109,20 +119,22 @@ function toggleDeafenHandler() {
   muted.value = deafened.value
 }
 
-// 5) subscribe to proximity updates
+// 5) subscribe to proximity updates on mount
 onMounted(() => {
   const saved = localStorage.getItem('guid')
   if (saved) {
     setGuid(saved)
     guidSet.value = true
     reconnectSocket()
-    if (proximityEnabled.value) connectProximitySocket()
+    if (proximityEnabled.value) {
+      connectProximitySocket()
+    }
   }
 
-   setInterval(() => {
+  // refresh debug list
+  setInterval(() => {
     nearbyPlayers.value = getNearbyPlayers()
   }, 1000)
-
 })
 </script>
 
