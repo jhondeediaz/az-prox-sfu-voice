@@ -15,15 +15,6 @@
       <label>
         <input
           type="checkbox"
-          v-model="proximityEnabled"
-          @change="toggleProximity"
-        />
-        Enable Proximity
-      </label>
-
-      <label>
-        <input
-          type="checkbox"
           v-model="muted"
           @change="toggleMuteHandler"
         />
@@ -39,7 +30,7 @@
         Deafen (mic + speakers)
       </label>
 
-      <button @click="guidSet = false">Change GUID</button>
+      <button @click="resetGuid">Change GUID</button>
 
       <!-- debug panel -->
       <div v-if="DEBUG" class="debug">
@@ -61,89 +52,70 @@ import {
   DEBUG,
   setGuid,
   resumeAudio,
-  connectProximitySocket,
-  disconnectProximity,
   reconnectSocket,
+  connectProximitySocket,
   toggleMute,
   toggleDeafen,
   getNearbyPlayers
 } from './webrtcClient.js'
 
-// reactive state
-const guidInput        = ref('')
-const guidSet          = ref(false)
-const proximityEnabled = ref(true)
-const muted            = ref(false)
-const deafened         = ref(false)
-const nearbyPlayers    = ref([])
+const guidInput      = ref('')
+const guidSet        = ref(false)
+const muted          = ref(false)
+const deafened       = ref(false)
+const nearbyPlayers  = ref([])
 
-// 1) when user clicks OK, save GUID & start socket
+// Called when the user enters their GUID
 async function setGuidHandler() {
   if (!guidInput.value) return
 
   setGuid(guidInput.value)
   guidSet.value = true
 
-  // ask for mic permission right here
-  try {
-    await navigator.mediaDevices.getUserMedia({ audio: true })
-  } catch (e) {
-    console.warn('Microphone permission denied', e)
-  }
-
-  // unlock AudioContext
+  // Unlock audio context so playback + mic work
   await resumeAudio()
 
-  // kick off proximity
+  // Kick off our socket+SFU logic
   reconnectSocket()
-  if (proximityEnabled.value) {
-    connectProximitySocket()
-  }
+  connectProximitySocket()
 }
 
-// 2) toggle proximity on/off
-async function toggleProximity() {
-  if (proximityEnabled.value) {
-    await resumeAudio()
-    connectProximitySocket()
-  } else {
-    await disconnectProximity()
-  }
+// Clicking “Change GUID” resets everything
+function resetGuid() {
+  guidSet.value = false
+  // (you could also clear localStorage here if desired)
 }
 
-// 3) toggle mute (mic only)
+// Mute/unmute mic only.
+// If un‐muting while still deafened, we clear “deafened”
 function toggleMuteHandler() {
   toggleMute(muted.value)
-
-  // if you un-mute while still deafened, clear Deafen
   if (!muted.value && deafened.value) {
     deafened.value = false
     toggleDeafen(false)
   }
 }
 
-// 4) toggle deafen (mic + speakers)
+// Deafen = mic + speakers.
+// Toggling deafened also forces muted checkbox on/off
 function toggleDeafenHandler() {
   toggleDeafen(deafened.value)
-
-  if (deafened.value) {
-    // entering deafen should also mute your mic
-    muted.value = true
-    toggleMute(true)
-  }
-  // exiting deafen leaves your mic state as-is
+  muted.value = deafened.value
 }
 
-// 5) subscribe to proximity updates on mount
+// On mount, if we already had a GUID saved, re‐hydrate
 onMounted(() => {
   const saved = localStorage.getItem('guid')
   if (saved) {
     setGuid(saved)
     guidSet.value = true
-    reconnectSocket()
-    if (proximityEnabled.value) connectProximitySocket()
+    resumeAudio().then(() => {
+      reconnectSocket()
+      connectProximitySocket()
+    })
   }
 
+  // keep the debug list up to date
   setInterval(() => {
     nearbyPlayers.value = getNearbyPlayers()
   }, 1000)
