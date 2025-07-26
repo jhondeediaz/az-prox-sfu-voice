@@ -16,10 +16,10 @@ let client          = null
 let localStream     = null
 let lastMapId       = null
 
-// your own position & the list of all peers with distances
+// track your own pos and peer list
 const state = { self: null, peers: [] }
 
-// one hidden <audio> element per peer GUID
+// one hidden <audio> element per peer
 const audioEls = {}   // peerGuid → HTMLAudioElement
 
 function log(...args) {
@@ -30,14 +30,13 @@ function log(...args) {
  * Compute volume:
  *   dist ≤ 1 yd  → 1.0
  *   dist ≥ 50 yd → 0.0
- *   otherwise    → linear ramp between
+ *   otherwise    → linear ramp between.
  */
 function computeVolume(dist) {
   if (dist <= 1)  return 1.0
   if (dist >= 50) return 0.0
   return 1 - (dist - 1) / 49
 }
-
 
 // ── PUBLIC API ─────────────────────────────────────────────────────────────
 
@@ -48,7 +47,7 @@ export function setGuid(id) {
 }
 
 export async function resumeAudio() {
-  // no-op: using plain <audio> elements
+  // no-op when using plain <audio>
 }
 
 export function getNearbyPlayers() {
@@ -63,13 +62,12 @@ export function toggleMute(muted) {
 }
 
 export function toggleDeafen(deafened) {
-  // mute all incoming
+  // mute all incoming audio
   Object.values(audioEls).forEach(a => a.muted = deafened)
-  // also mute your mic
+  // also mute mic
   toggleMute(deafened)
   log(`Deafen ${deafened ? 'on' : 'off'}`)
 }
-
 
 // ── PROXIMITY SOCKET ───────────────────────────────────────────────────────
 
@@ -104,18 +102,17 @@ export async function disconnectProximity() {
     await client.close().catch(() => {})
     client = null
   }
-  // silence any leftover audio
+  // silence leftovers
   Object.values(audioEls).forEach(a => a.muted = true)
   log('Proximity disabled')
 }
-
 
 // ── PROXIMITY HANDLER ──────────────────────────────────────────────────────
 
 async function handleProximity({ data }) {
   const maps = JSON.parse(data)
 
-  // 1) find yourself
+  // 1) find our own packet
   let me = null
   for (const arr of Object.values(maps)) {
     const f = arr.find(p => p.guid.toString() === guid)
@@ -126,7 +123,7 @@ async function handleProximity({ data }) {
   state.self = me
   const mapId = me.map.toString()
 
-  // 2) build peer list with distances
+  // 2) build peer list with computed distances
   const peers = (maps[mapId] || [])
     .filter(p => p.guid.toString() !== guid)
     .map(p => {
@@ -141,7 +138,7 @@ async function handleProximity({ data }) {
 
   state.peers = peers
 
-  // 3) if map changed, re-join SFU
+  // 3) if map changed, (re)join SFU once
   if (mapId !== lastMapId) {
     lastMapId = mapId
     await joinAndPublish(`map-${mapId}`)
@@ -154,17 +151,14 @@ async function handleProximity({ data }) {
   })
 }
 
-
 // ── SFU JOIN & PUBLISH ──────────────────────────────────────────────────────
 
 async function joinAndPublish(roomId) {
-  // clean up old client & audio tags
+  // teardown old client
   if (client) {
     await client.close().catch(e => log('SFU close error', e))
     client = null
   }
-  Object.values(audioEls).forEach(a => a.remove())
-  Object.keys(audioEls).forEach(k => delete audioEls[k])
 
   // new SFU client
   const signal = new IonSFUJSONRPCSignal(SFU_WS)
@@ -179,7 +173,7 @@ async function joinAndPublish(roomId) {
       const peerGuid = (remoteStream.peerId || remoteStream.id).toString()
       log('ontrack for peer', peerGuid)
 
-      // wrap single track into its own MediaStream
+      // wrap single track in its own MediaStream
       const ms = new MediaStream([track])
       const a  = new Audio()
       a.dataset.peer  = peerGuid
@@ -187,7 +181,7 @@ async function joinAndPublish(roomId) {
       a.autoplay      = true
       a.controls      = false
       a.style.display = 'none'
-      // start at correct volume
+      // initial volume from current state
       const peer = state.peers.find(x => x.guid === peerGuid)
       a.volume = peer ? computeVolume(peer.distance) : 0
 
@@ -205,11 +199,10 @@ async function joinAndPublish(roomId) {
       log('🎤 published local stream')
     })().catch(err => {
       console.error('[webrtc] SFU error:', err)
-      lastMapId = roomId // stop retry loops
+      lastMapId = roomId // prevent retry loops
     })
   }
 }
-
 
 // ── AUTO-BOOTSTRAP ─────────────────────────────────────────────────────────
 
