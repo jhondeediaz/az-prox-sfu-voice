@@ -39,12 +39,12 @@ function computeVolume(dist) {
 function update3DPositions() {
   if (!state.self) return
 
-  // move listener to your position
+  // move listener to your avatar’s position
   audioCtx.listener.positionX.setValueAtTime(state.self.x, audioCtx.currentTime)
   audioCtx.listener.positionY.setValueAtTime(state.self.y, audioCtx.currentTime)
   audioCtx.listener.positionZ.setValueAtTime(state.self.z || 0, audioCtx.currentTime)
 
-  // move each peer’s panner
+  // move each remote peer’s panner
   for (const p of state.players) {
     const entry = audioEls[p.guid.toString()]
     if (!entry) continue
@@ -113,7 +113,7 @@ export function connectProximitySocket() {
     const maps = JSON.parse(data)
     log('got maps payload →', maps)
 
-    // find self
+    // find self packet
     let selfPkt = null
     for (const arr of Object.values(maps)) {
       const f = arr.find(p => p.guid.toString() === guid)
@@ -121,6 +121,7 @@ export function connectProximitySocket() {
     }
     if (!selfPkt) return log('No self entry yet')
 
+    // update state.self & state.players
     state.self = selfPkt
     const roomKey    = selfPkt.map.toString()
     const allPlayers = maps[roomKey] || []
@@ -164,59 +165,52 @@ export function disconnectProximity() {
 // ── SFU JOIN & PUBLISH ──────────────────────────────────────────────────────
 async function _joinAndPublish(roomId) {
   if (client) {
-    await client.close().catch(e => log('close error', e));
-    client = null;
+    await client.close().catch(e => log('close error', e))
+    client = null
   }
 
-  signal = new IonSFUJSONRPCSignal(SFU_WS);
-  client = new SFUClient(signal);
+  signal = new IonSFUJSONRPCSignal(SFU_WS)
+  client = new SFUClient(signal)
 
   signal.onopen = async () => {
-    log('Signal open → joining SFU room:', roomId);
+    log('Signal open → joining SFU room:', roomId)
 
-    // Spatial audio handler
     client.ontrack = (track, remoteStream) => {
-      if (track.kind !== 'audio') return;
-      const peerId = (remoteStream.peerId || remoteStream.id).toString();
-      log('🔊 spatial ontrack for peer', peerId);
+      if (track.kind !== 'audio') return
+      const peerId = (remoteStream.peerId || remoteStream.id).toString()
+      log('🔊 spatial ontrack for peer', peerId)
 
-      // Resume AudioContext if needed
+      // resume context
       if (audioCtx.state === 'suspended') {
-        audioCtx.resume().catch(console.error);
+        audioCtx.resume().catch(console.error)
       }
 
-      // Create MediaStreamSource → PannerNode → Destination
-      const ms     = remoteStream.mediaStream || remoteStream;
-      const source = audioCtx.createMediaStreamSource(ms);
-      const pan    = audioCtx.createPanner();
-      pan.panningModel  = 'HRTF';
-      pan.distanceModel = 'inverse';
-      pan.refDistance   = 1;
-      pan.maxDistance   = 100;
-      pan.rolloffFactor = 1;
+      const ms     = remoteStream.mediaStream || remoteStream
+      const source = audioCtx.createMediaStreamSource(ms)
+      const pan    = audioCtx.createPanner()
+      pan.panningModel  = 'HRTF'
+      pan.distanceModel = 'inverse'
+      pan.refDistance   = 1
+      pan.maxDistance   = 100
+      pan.rolloffFactor = 1
 
-      source.connect(pan);
-      pan.connect(audioCtx.destination);
+      source.connect(pan)
+      pan.connect(audioCtx.destination)
 
-      // Keep track so update3DPositions can move it
-      audioEls[peerId] = { panner: pan };
-    };
+      audioEls[peerId] = { panner: pan }
+    }
 
     try {
-      // Get mic and join
-      localStream = await LocalStream.getUserMedia({ audio: true, video: false });
-      await client.join(roomId, guid);
-      log('✅ joined room', roomId, 'as GUID=', guid);
-
-      // Publish mic
-      await client.publish(localStream);
-      log('🎤 published local stream');
+      localStream = await LocalStream.getUserMedia({ audio: true, video: false })
+      await client.join(roomId, guid)
+      log('✅ joined room', roomId, 'as GUID=', guid)
+      await client.publish(localStream)
+      log('🎤 published local stream')
     } catch (err) {
-      console.error('[webrtc] SFU join/publish error:', err);
-      // Prevent retry loops
-      currentRoom = roomId;
+      console.error('[webrtc] SFU join/publish error:', err)
+      currentRoom = roomId
     }
-  };
+  }
 }
 
 async function _maybeJoinRoom() {
