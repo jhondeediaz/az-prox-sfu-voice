@@ -71,10 +71,8 @@ async function setGuidHandler() {
   setGuid(guidInput.value)
   guidSet.value = true
 
-  // unlock audio context for playback & mic
+  // unlock audio context and start SFU/proximity flow
   await resumeAudio()
-
-  // start the proximity → SFU flow
   reconnectSocket()
 }
 
@@ -85,7 +83,7 @@ function resetGuid() {
 }
 
 // Mute/unmute mic only.
-// If they un‐mute while still deafened, clear deafen.
+// If they un-mute while still deafened, clear deafen.
 function toggleMuteHandler() {
   toggleMute(muted.value)
   if (!muted.value && deafened.value) {
@@ -95,20 +93,19 @@ function toggleMuteHandler() {
 }
 
 // Deafen = mute mic + silence all incoming.
-// Toggling deafen also forces the mic‐mute checkbox.
+// Toggling deafen also forces the mic-mute checkbox.
 function toggleDeafenHandler() {
   toggleDeafen(deafened.value)
-  if (deafened.value) {
-    muted.value = true
-  }
+  // mirror “deafened” into the mic‐muted checkbox
+  muted.value = deafened.value
 }
 
+// On mount, if we already had a GUID, rehydrate and reconnect
 onMounted(() => {
   const saved = localStorage.getItem('guid')
   if (saved) {
     setGuid(saved)
     guidSet.value = true
-    // unlock & reconnect
     resumeAudio().then(reconnectSocket)
   }
 
