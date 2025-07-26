@@ -164,51 +164,59 @@ export function disconnectProximity() {
 // ── SFU JOIN & PUBLISH ──────────────────────────────────────────────────────
 async function _joinAndPublish(roomId) {
   if (client) {
-    await client.close().catch(e => log('close error', e))
-    client = null
+    await client.close().catch(e => log('close error', e));
+    client = null;
   }
 
-  signal = new IonSFUJSONRPCSignal(SFU_WS)
-  client = new SFUClient(signal)
+  signal = new IonSFUJSONRPCSignal(SFU_WS);
+  client = new SFUClient(signal);
 
   signal.onopen = async () => {
-    log('Signal open → joining SFU room:', roomId)
+    log('Signal open → joining SFU room:', roomId);
 
+    // Spatial audio handler
     client.ontrack = (track, remoteStream) => {
-      if (track.kind !== 'audio') return
-      const peerId = (remoteStream.peerId || remoteStream.id).toString()
-      log('🔊 spatial ontrack for peer', peerId)
+      if (track.kind !== 'audio') return;
+      const peerId = (remoteStream.peerId || remoteStream.id).toString();
+      log('🔊 spatial ontrack for peer', peerId);
 
+      // Resume AudioContext if needed
       if (audioCtx.state === 'suspended') {
-        audioCtx.resume().catch(console.error)
+        audioCtx.resume().catch(console.error);
       }
 
-      const ms  = remoteStream.mediaStream || remoteStream
-      const src = audioCtx.createMediaStreamSource(ms)
-      const pan = audioCtx.createPanner()
-      pan.panningModel  = 'HRTF'
-      pan.distanceModel = 'inverse'
-      pan.refDistance   = 1
-      pan.maxDistance   = 100
-      pan.rolloffFactor = 1
+      // Create MediaStreamSource → PannerNode → Destination
+      const ms     = remoteStream.mediaStream || remoteStream;
+      const source = audioCtx.createMediaStreamSource(ms);
+      const pan    = audioCtx.createPanner();
+      pan.panningModel  = 'HRTF';
+      pan.distanceModel = 'inverse';
+      pan.refDistance   = 1;
+      pan.maxDistance   = 100;
+      pan.rolloffFactor = 1;
 
-      src.connect(pan)
-      pan.connect(audioCtx.destination)
+      source.connect(pan);
+      pan.connect(audioCtx.destination);
 
-      audioEls[peerId] = { panner: pan }
-    }
+      // Keep track so update3DPositions can move it
+      audioEls[peerId] = { panner: pan };
+    };
 
     try {
-      localStream = await LocalStream.getUserMedia({ audio: true, video: false })
-      await client.join(roomId, guid)
-      log('✅ joined room', roomId, 'as GUID=', guid)
-      await client.publish(localStream)
-      log('🎤 published local stream')
+      // Get mic and join
+      localStream = await LocalStream.getUserMedia({ audio: true, video: false });
+      await client.join(roomId, guid);
+      log('✅ joined room', roomId, 'as GUID=', guid);
+
+      // Publish mic
+      await client.publish(localStream);
+      log('🎤 published local stream');
     } catch (err) {
-      console.error('[webrtc] SFU join/publish error:', err)
-      currentRoom = roomId
+      console.error('[webrtc] SFU join/publish error:', err);
+      // Prevent retry loops
+      currentRoom = roomId;
     }
-  }
+  };
 }
 
 async function _maybeJoinRoom() {
